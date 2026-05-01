@@ -10935,8 +10935,28 @@ impl Workspace {
 
         if active_was_in_run {
             self.active_tab_index = target + active_offset_in_run;
-        } else if target <= self.active_tab_index {
-            self.active_tab_index += drained_len;
+        } else {
+            // Active is in pre-drain coordinates. Two adjustments in order:
+            //
+            //  1. Drain shift: if active was past the run, the drain at
+            //     run.start..run.end shifted it down by drained_len. After
+            //     this step, `self.active_tab_index` is in post-drain
+            //     coordinates, which is the coordinate space `target`
+            //     already lives in (the snap loop reads the post-drain
+            //     vector).
+            //  2. Splice shift: if the splice insertion point sits at or
+            //     before the post-drain active index, the drained_len
+            //     elements pushed in shift active back up by drained_len.
+            //
+            // The previous version skipped (1) and double-shifted at (2),
+            // which pushed active_tab_index past tabs.len() when active
+            // sat past the run.
+            if self.active_tab_index >= run.end {
+                self.active_tab_index -= drained_len;
+            }
+            if target <= self.active_tab_index {
+                self.active_tab_index += drained_len;
+            }
         }
         self.debug_assert_tab_group_invariants();
         ctx.notify();
