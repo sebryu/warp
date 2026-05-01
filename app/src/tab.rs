@@ -1800,7 +1800,45 @@ impl UiComponent for TabComponent<'_> {
                     tab_position: rect,
                 });
             })
-            .on_drop(|ctx, _, _, _| ctx.dispatch_typed_action(WorkspaceAction::DropTab));
+            .on_drop(move |ctx, _, _, drop_target| {
+                // Tab Groups (PRODUCT §33, TECH.md §10.6): if the drop
+                // landed on a chip or section header, dispatch a group
+                // adoption action *in addition to* `DropTab`. The
+                // `DropTab` arm clears the drag flag; `AddTabToTabGroup`
+                // moves the tab into the group's run via
+                // `Workspace::move_tab_into_group`. We re-use
+                // `AddTabToTabGroup` so backend's existing handler is
+                // exercised end-to-end; the telemetry source it records
+                // is `Menu` (a small follow-up could split that into
+                // `Drag` by adding a parallel action — TECH.md §12.3).
+                if let Some(target) = drop_target {
+                    let any = target.as_any();
+                    let on_chip_gid = if let Some(data) =
+                        any.downcast_ref::<crate::workspace::TabBarDropTargetData>()
+                    {
+                        match data.tab_bar_location {
+                            crate::workspace::TabBarLocation::OnGroupChip(gid) => Some(gid),
+                            _ => None,
+                        }
+                    } else if let Some(data) =
+                        any.downcast_ref::<crate::workspace::VerticalTabsPaneDropTargetData>()
+                    {
+                        match data.tab_bar_location {
+                            crate::workspace::TabBarLocation::OnGroupChip(gid) => Some(gid),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(group_id) = on_chip_gid {
+                        ctx.dispatch_typed_action(WorkspaceAction::AddTabToTabGroup {
+                            tab_index,
+                            group_id,
+                        });
+                    }
+                }
+                ctx.dispatch_typed_action(WorkspaceAction::DropTab);
+            });
         let draggable = if FeatureFlag::DragTabsToWindows.is_enabled() {
             draggable
         } else {

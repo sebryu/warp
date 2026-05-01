@@ -920,6 +920,11 @@ pub struct Workspace {
     /// so the two menus can briefly coexist (e.g. while one fades out).
     tab_group_right_click_menu: ViewHandle<Menu<WorkspaceAction>>,
     show_tab_group_right_click_menu: Option<(crate::workspace::tab_group::TabGroupId, Vector2F)>,
+    /// Latest drag position of the chip currently being dragged. Updated
+    /// every `DragTabGroup` and consumed in `drop_tab_group` to compute
+    /// the target landing index for `Workspace::reorder_group`
+    /// (TECH.md §10.7). `None` when no chip drag is in flight.
+    dragging_tab_group: Option<(crate::workspace::tab_group::TabGroupId, RectF)>,
     // TODO(CORE-2300): this used to be add_tab_dropdown_menu.
     // Because we are rolling out the change behind a feature flag,
     // keep this comment here until the feature flag is removed.
@@ -3173,6 +3178,7 @@ impl Workspace {
             show_tab_right_click_menu: None,
             tab_group_right_click_menu,
             show_tab_group_right_click_menu: None,
+            dragging_tab_group: None,
             new_session_dropdown_menu,
             show_new_session_dropdown_menu: None,
             changelog_model,
@@ -10873,11 +10879,81 @@ impl Workspace {
         group_id: crate::workspace::tab_group::TabGroupId,
         ctx: &mut ViewContext<Self>,
     ) {
-        // Without UI-side drag math wired (task #5), drop is a no-op that
-        // resets transient drag state. Once `calculate_updated_group_position`
-        // exists, replace this with `self.reorder_group(...)`.
-        let _ = group_id;
-        ctx.notify();
+        // PRODUCT §40, TECH.md §10.7: read the chip's last reported drag
+        // rect and translate it to a target landing index for the run's
+        // first member. `reorder_group` already snaps to non-group-
+        // interior boundaries (PRODUCT §4) so we can hand it the rough
+        // index produced by the midpoint walk below.
+        let drag_position = match self.dragging_tab_group.take() {
+            Some((tracked_id, rect)) if tracked_id == group_id => rect,
+            _ => {
+                // Spurious DropTabGroup with no preceding drag state —
+                // bail without dispatching a reorder.
+                ctx.notify();
+                return;
+            }
+        };
+
+        let is_vertical = FeatureFlag::VerticalTabs.is_enabled()
+            && *crate::workspace::tab_settings::TabSettings::as_ref(ctx).use_vertical_tabs;
+        let target =
+            self.calculate_updated_group_position(group_id, drag_position, is_vertical, ctx);
+        self.reorder_group(group_id, target, ctx);
+        send_telemetry_from_ctx!(TelemetryEvent::DragAndDropTabGroup, ctx);
+    }
+
+    /// Computes the target landing index for the *first member* of `group_id`'s
+    /// run, given the chip's drag rect (TECH.md §10.7). Walks all tabs that
+    /// are NOT members of the group and finds the position the chip's
+    /// midpoint falls before. Backend's `reorder_group` snaps the result
+    /// to a non-group-interior boundary.
+    fn calculate_updated_group_position(
+        &self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+        drag_position: RectF,
+        is_vertical: bool,
+        ctx: &mut ViewContext<Self>,
+    ) -> usize {
+        let run = self.group_member_range(group_id);
+        let drag_mid = if is_vertical {
+            (drag_position.min_y() + drag_position.max_y()) / 2.
+        } else {
+            (drag_position.min_x() + drag_position.max_x()) / 2.
+        };
+        // Walk in tab order; for each non-member tab, compare its midpoint
+        // to the drag midpoint. The first non-member tab whose midpoint is
+        // greater than the drag's midpoint is where the run should land.
+        let mut target = run.start;
+        let mut saw_neighbor = false;
+        for i in 0..self.tabs.len() {
+            if (run.start..run.end).contains(&i) {
+                continue;
+            }
+            let Some(rect) = ctx.element_position_by_id(tab_position_id(i)) else {
+                continue;
+            };
+            let mid = if is_vertical {
+                (rect.min_y() + rect.max_y()) / 2.
+            } else {
+                (rect.min_x() + rect.max_x()) / 2.
+            };
+            if drag_mid < mid {
+                // Land before this neighbor.
+                target = i;
+                saw_neighbor = true;
+                break;
+            } else {
+                target = i + 1;
+                saw_neighbor = true;
+            }
+        }
+        if !saw_neighbor {
+            // No non-member tabs (group is the entire workspace) — keep
+            // the run where it is.
+            run.start
+        } else {
+            target
+        }
     }
 
     /// In-place reorder primitive that preserves contiguity (TECH.md §7.3).
@@ -22561,12 +22637,19 @@ impl TypedActionView for Workspace {
             ToggleTabGroupContextMenu { group_id, position } => {
                 self.toggle_tab_group_context_menu(*group_id, *position, ctx);
             }
-            StartTabGroupDrag { .. } => {
-                // Drag state is held by `TabGroup::draggable_state` and is
-                // updated when the UI emits DragTabGroup / DropTabGroup.
+            StartTabGroupDrag { group_id } => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    // Stash a starting marker so `dragging_tab_group` is
+                    // populated even if no DragTabGroup fires before the
+                    // drop (e.g. instant drop with no movement). Position
+                    // gets refined by every `DragTabGroup` below.
+                    self.dragging_tab_group = Some((*group_id, RectF::default()));
+                }
             }
-            DragTabGroup { .. } => {
-                // Per-frame drag position update; consumed by chip rendering.
+            DragTabGroup { group_id, position } => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    self.dragging_tab_group = Some((*group_id, *position));
+                }
             }
             DropTabGroup { group_id } => {
                 if FeatureFlag::TabGroups.is_enabled() {

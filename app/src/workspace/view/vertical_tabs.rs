@@ -2153,7 +2153,36 @@ fn render_tab_group(
                 tab_position: rect,
             });
         })
-        .on_drop(|ctx, _, _, _| {
+        .on_drop(move |ctx, _, _, drop_target| {
+            // Tab Groups (PRODUCT §33, TECH.md §10.6): see the equivalent
+            // closure in `tab.rs::TabComponent::build`. When the drop
+            // landed on a section header, also dispatch
+            // `AddTabToTabGroup` so the tab is moved into the group.
+            if let Some(target) = drop_target {
+                let any = target.as_any();
+                let on_chip_gid =
+                    if let Some(data) = any.downcast_ref::<VerticalTabsPaneDropTargetData>() {
+                        match data.tab_bar_location {
+                            TabBarLocation::OnGroupChip(gid) => Some(gid),
+                            _ => None,
+                        }
+                    } else if let Some(data) =
+                        any.downcast_ref::<crate::workspace::TabBarDropTargetData>()
+                    {
+                        match data.tab_bar_location {
+                            TabBarLocation::OnGroupChip(gid) => Some(gid),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                if let Some(group_id) = on_chip_gid {
+                    ctx.dispatch_typed_action(WorkspaceAction::AddTabToTabGroup {
+                        tab_index,
+                        group_id,
+                    });
+                }
+            }
             ctx.dispatch_typed_action(WorkspaceAction::DropTab);
         })
         .with_drag_axis(DragAxis::VerticalOnly)
