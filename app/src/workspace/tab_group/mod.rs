@@ -17,6 +17,7 @@ use warp_core::ui::theme::WarpTheme;
 use warpui::elements::{DraggableState, Fill, MouseStateHandle};
 
 pub mod chip;
+pub mod vertical_section;
 
 /// Distinguishes how a tab-group operation was initiated, so telemetry can
 /// separate menu-driven vs. drag-driven actions (TECH.md §12.3).

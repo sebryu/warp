@@ -1645,16 +1645,114 @@ fn render_groups(
         groups = groups.with_spacing(TABS_MODE_ITEM_SPACING);
     }
 
-    for (visible_tab_index, (tab_index, filtered_pane_ids)) in visible_tabs.iter().enumerate() {
-        let insert_before_index = *tab_index;
-        let insert_after_index =
-            (visible_tab_index == visible_tabs.len() - 1).then_some(tab_index + 1);
+    // Tab Groups (PRODUCT §22, §63-64, TECH.md §10.1): walk visible_tabs
+    // and wrap contiguous runs of grouped tabs in a section (header +
+    // indented member rows with color stripe). When a search query is
+    // active we override the stored collapse state to `false` so matches
+    // are always visible (PRODUCT §64) — without mutating the registry.
+    let tab_groups_enabled = FeatureFlag::TabGroups.is_enabled();
+    let is_search_active = !query.is_empty();
+    let mut visible_idx = 0usize;
+    while visible_idx < visible_tabs.len() {
+        let (tab_index, _) = visible_tabs[visible_idx];
+
+        // Find the end of this tab's group run within the visible_tabs
+        // slice — only when the tab is grouped and the flag is on.
+        let group_run_in_visible: Option<(
+            crate::workspace::tab_group::TabGroupId,
+            usize, // end index (exclusive) within visible_tabs
+        )> = if tab_groups_enabled {
+            workspace.tabs[tab_index].group_id.map(|gid| {
+                let end = visible_tabs[visible_idx..]
+                    .iter()
+                    .position(|(t, _)| workspace.tabs[*t].group_id != Some(gid))
+                    .map(|n| visible_idx + n)
+                    .unwrap_or(visible_tabs.len());
+                (gid, end)
+            })
+        } else {
+            None
+        };
+
+        if let Some((gid, run_end_visible)) = group_run_in_visible {
+            if let Some(group) = workspace.tab_groups.get(gid) {
+                let total_member_count = workspace.group_member_range(gid).len();
+                let effective_collapsed = if is_search_active {
+                    // Search override (PRODUCT §64): never hide matches
+                    // behind a collapsed section.
+                    false
+                } else {
+                    group.collapsed
+                };
+
+                let header = crate::workspace::tab_group::vertical_section::render_section_header(
+                    group,
+                    total_member_count,
+                    effective_collapsed,
+                    &appearance,
+                    app,
+                );
+
+                let member_rows: Vec<Box<dyn Element>> = if effective_collapsed {
+                    Vec::new()
+                } else {
+                    let mut rows = Vec::with_capacity(run_end_visible - visible_idx);
+                    for (visible_tab_index, (member_tab_index, member_filtered_pane_ids)) in
+                        visible_tabs[visible_idx..run_end_visible]
+                            .iter()
+                            .enumerate()
+                    {
+                        let absolute_visible_tab_index = visible_idx + visible_tab_index;
+                        let insert_before_index = *member_tab_index;
+                        let insert_after_index = (absolute_visible_tab_index
+                            == visible_tabs.len() - 1)
+                            .then_some(member_tab_index + 1);
+                        let member = render_tab_group(
+                            state,
+                            workspace,
+                            *member_tab_index,
+                            &workspace.tabs[*member_tab_index],
+                            member_filtered_pane_ids.as_deref(),
+                            TabGroupDragState {
+                                is_any_pane_dragging,
+                                insert_before_index,
+                                insert_after_index,
+                            },
+                            app,
+                        );
+                        rows.push(
+                            crate::workspace::tab_group::vertical_section::wrap_member_row(
+                                member,
+                                group,
+                                &appearance,
+                            ),
+                        );
+                    }
+                    rows
+                };
+
+                groups.add_child(
+                    crate::workspace::tab_group::vertical_section::build_section_column(
+                        header,
+                        member_rows,
+                    ),
+                );
+                visible_idx = run_end_visible;
+                continue;
+            }
+            // Group disappeared from registry (race) — fall through and
+            // render the tab as ungrouped to keep the panel responsive.
+        }
+
+        // Ungrouped tab (or feature flag off, or registry race).
+        let insert_before_index = tab_index;
+        let insert_after_index = (visible_idx == visible_tabs.len() - 1).then_some(tab_index + 1);
         groups.add_child(render_tab_group(
             state,
             workspace,
-            *tab_index,
-            &workspace.tabs[*tab_index],
-            filtered_pane_ids.as_deref(),
+            tab_index,
+            &workspace.tabs[tab_index],
+            visible_tabs[visible_idx].1.as_deref(),
             TabGroupDragState {
                 is_any_pane_dragging,
                 insert_before_index,
@@ -1662,6 +1760,7 @@ fn render_groups(
             },
             app,
         ));
+        visible_idx += 1;
     }
 
     // Prune stale badge mouse states for panes that no longer exist.
