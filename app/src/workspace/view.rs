@@ -769,6 +769,7 @@ type WorkspaceMenuHandles = (
     ViewHandle<Menu<WorkspaceAction>>,
     ViewHandle<Menu<WorkspaceAction>>,
     ViewHandle<Menu<NewSessionSidecarSelection>>,
+    ViewHandle<Menu<WorkspaceAction>>,
 );
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -910,6 +911,11 @@ pub struct Workspace {
     show_tab_bar_overflow_menu: bool,
     tab_right_click_menu: ViewHandle<Menu<WorkspaceAction>>,
     show_tab_right_click_menu: Option<(usize, TabContextMenuAnchor)>,
+    /// Right-click menu on a Tab Group chip / section header
+    /// (PRODUCT §30, §69). Distinct view-handle from `tab_right_click_menu`
+    /// so the two menus can briefly coexist (e.g. while one fades out).
+    tab_group_right_click_menu: ViewHandle<Menu<WorkspaceAction>>,
+    show_tab_group_right_click_menu: Option<(crate::workspace::tab_group::TabGroupId, Vector2F)>,
     // TODO(CORE-2300): this used to be add_tab_dropdown_menu.
     // Because we are rolling out the change behind a feature flag,
     // keep this comment here until the feature flag is removed.
@@ -1788,7 +1794,21 @@ impl Workspace {
             me.handle_new_session_sidecar_event(event, ctx);
         });
 
-        (tab_right_click_menu, new_session_menu, new_session_sidecar)
+        // Tab Group right-click menu (PRODUCT §30, §69). Uses the same
+        // Menu primitive as `tab_right_click_menu`; the only differences
+        // are the items it gets populated with and the position/lifetime
+        // markers tracked by `show_tab_group_right_click_menu`.
+        let tab_group_right_click_menu = ctx.add_typed_action_view(|_| Menu::new());
+        ctx.subscribe_to_view(&tab_group_right_click_menu, move |me, _, event, ctx| {
+            me.handle_tab_group_right_click_menu_event(event, ctx);
+        });
+
+        (
+            tab_right_click_menu,
+            new_session_menu,
+            new_session_sidecar,
+            tab_group_right_click_menu,
+        )
     }
 
     fn build_launch_config_save_modal(
@@ -2551,8 +2571,12 @@ impl Workspace {
         terminal::platform::init().expect("Terminal platform initialized");
 
         let tab_bar_overflow_menu = Self::build_tab_bar_overflow_menu(ctx);
-        let (tab_right_click_menu, new_session_dropdown_menu, new_session_sidecar_menu) =
-            Self::build_menus(ctx);
+        let (
+            tab_right_click_menu,
+            new_session_dropdown_menu,
+            new_session_sidecar_menu,
+            tab_group_right_click_menu,
+        ) = Self::build_menus(ctx);
 
         // Subscribe to network changes
         ctx.subscribe_to_model(
@@ -3055,6 +3079,8 @@ impl Workspace {
             show_tab_bar_overflow_menu: false,
             tab_right_click_menu,
             show_tab_right_click_menu: None,
+            tab_group_right_click_menu,
+            show_tab_group_right_click_menu: None,
             new_session_dropdown_menu,
             show_new_session_dropdown_menu: None,
             changelog_model,
@@ -6572,6 +6598,105 @@ impl Workspace {
         self.show_tab_right_click_menu = Some((tab_index, TabContextMenuAnchor::Pointer(position)));
         ctx.focus(&self.tab_right_click_menu);
         ctx.notify();
+    }
+
+    /// Right-click on a Tab Group chip / section header (PRODUCT §30, §69).
+    /// Toggles the chip menu; the menu items are: Rename, Recolor (sub),
+    /// Collapse / Expand, Ungroup, Close group.
+    pub fn toggle_tab_group_context_menu(
+        &mut self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+        position: Vector2F,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !FeatureFlag::TabGroups.is_enabled() {
+            return;
+        }
+        if self.show_tab_group_right_click_menu.is_some() {
+            self.show_tab_group_right_click_menu = None;
+            ctx.notify();
+            return;
+        }
+        let Some(menu_items) = self.tab_group_menu_items(group_id) else {
+            // Group disappeared between right-click and dispatch — drop.
+            return;
+        };
+        ctx.update_view(
+            &self.tab_group_right_click_menu,
+            |context_menu, view_ctx| {
+                context_menu.set_items(menu_items, view_ctx);
+            },
+        );
+        self.show_tab_group_right_click_menu = Some((group_id, position));
+        ctx.focus(&self.tab_group_right_click_menu);
+        ctx.notify();
+    }
+
+    /// Constructs the chip / section-header right-click menu items
+    /// (PRODUCT §30). Returns `None` when the group is no longer in the
+    /// registry (e.g. closed during the click round-trip).
+    fn tab_group_menu_items(
+        &self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+    ) -> Option<Vec<MenuItem<WorkspaceAction>>> {
+        let group = self.tab_groups.get(group_id)?;
+        // Recolor submenu — checked entry for the current color
+        // (PRODUCT §16).
+        let recolor_items: Vec<MenuItem<WorkspaceAction>> =
+            crate::workspace::tab_group::TabGroupColor::all_in_order()
+                .into_iter()
+                .map(|color| {
+                    let mut item = MenuItemFields::new(color.display_name()).with_on_select_action(
+                        WorkspaceAction::RecolorTabGroup { group_id, color },
+                    );
+                    if color == group.color {
+                        // The Menu primitive does not have a built-in
+                        // "checked" affordance reachable from
+                        // `MenuItemFields`; use the same disabled-look
+                        // used elsewhere when the option is "current",
+                        // and append a glyph to communicate selection.
+                        item = item.with_disabled(true);
+                    }
+                    item.into_item()
+                })
+                .collect();
+        #[allow(deprecated)]
+        let recolor_submenu = MenuItem::submenu("Recolor", recolor_items);
+
+        let collapse_label = if group.collapsed {
+            "Expand"
+        } else {
+            "Collapse"
+        };
+
+        Some(vec![
+            MenuItemFields::new("Rename")
+                .with_on_select_action(WorkspaceAction::RenameTabGroup { group_id })
+                .into_item(),
+            recolor_submenu,
+            MenuItemFields::new(collapse_label)
+                .with_on_select_action(WorkspaceAction::ToggleTabGroupCollapsed { group_id })
+                .into_item(),
+            MenuItem::Separator,
+            MenuItemFields::new("Ungroup")
+                .with_on_select_action(WorkspaceAction::UngroupTabGroup { group_id })
+                .into_item(),
+            MenuItemFields::new("Close group")
+                .with_on_select_action(WorkspaceAction::CloseTabGroup { group_id })
+                .into_item(),
+        ])
+    }
+
+    /// Menu close handler — symmetric with `handle_tab_right_click_menu_event`.
+    fn handle_tab_group_right_click_menu_event(
+        &mut self,
+        event: &MenuEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if let MenuEvent::Close { via_select_item: _ } = event {
+            self.show_tab_group_right_click_menu = None;
+            ctx.notify();
+        }
     }
 
     /// The tab bar overflow menu is the context menu that appears when
@@ -22300,8 +22425,8 @@ impl TypedActionView for Workspace {
                     self.close_tab_group(*group_id, ctx);
                 }
             }
-            ToggleTabGroupContextMenu { .. } => {
-                // Menu rendering wiring lives with the UI work (task #5).
+            ToggleTabGroupContextMenu { group_id, position } => {
+                self.toggle_tab_group_context_menu(*group_id, *position, ctx);
             }
             StartTabGroupDrag { .. } => {
                 // Drag state is held by `TabGroup::draggable_state` and is
@@ -22852,6 +22977,21 @@ impl View for Workspace {
                     );
                 }
             }
+        }
+
+        // Tab Group right-click menu (PRODUCT §30, §69). Anchored to the
+        // mouse position recorded when the chip / section header was
+        // right-clicked.
+        if let Some((_group_id, position)) = self.show_tab_group_right_click_menu {
+            stack.add_positioned_overlay_child(
+                ChildView::new(&self.tab_group_right_click_menu).finish(),
+                OffsetPositioning::offset_from_parent(
+                    position,
+                    ParentOffsetBounds::WindowByPosition,
+                    ParentAnchor::TopLeft,
+                    ChildAnchor::TopLeft,
+                ),
+            );
         }
 
         if let Some(position) = self.show_header_toolbar_context_menu {
