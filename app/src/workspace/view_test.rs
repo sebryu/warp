@@ -3379,6 +3379,57 @@ fn chip_drag_moves_whole_run_together() {
 }
 
 #[test]
+fn reorder_group_tracks_active_when_active_past_run_end() {
+    // Regression test for the active-past-run bug fixed in 4cade59 + the
+    // follow-up to that. `reorder_group` must apply both the drain shift
+    // (active was past the run end → drained_len) and the splice shift
+    // (target sits at-or-before post-drain active → +drained_len) so that
+    // active ends up tracking the same `TabData` even when active was
+    // *not* in the moved run. The previous version skipped the drain
+    // adjustment and double-shifted on the splice, pushing active past
+    // tabs.len() and panicking on the next `active_tab_pane_group()`.
+    let _flag = FeatureFlag::TabGroups.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            // tabs = [A0, A1, t2, t3(B), t4(B), t5]
+            for _ in 0..5 {
+                workspace.add_terminal_tab(false, ctx);
+            }
+            assert_eq!(workspace.tabs.len(), 6);
+            let g_a = install_group(workspace, "A", TabGroupColor::Blue);
+            let g_b = install_group(workspace, "B", TabGroupColor::Red);
+            workspace.tabs[0].group_id = Some(g_a);
+            workspace.tabs[1].group_id = Some(g_a);
+            workspace.tabs[3].group_id = Some(g_b);
+            workspace.tabs[4].group_id = Some(g_b);
+
+            // Active is t5 (index 5) — past group A's run (0..2). Capture
+            // its identity so we can verify it landed at the new index.
+            workspace.active_tab_index = 5;
+            let id_active = workspace.tabs[5].pane_group.id();
+
+            // Move group A to the end. Final layout (with the snap from
+            // PRODUCT §4 that prevents A from splitting B):
+            //   [t2, t3(B), t4(B), t5, A0, A1]
+            // active was t5 → expected to track to index 3.
+            workspace.reorder_group(g_a, workspace.tabs.len(), ctx);
+
+            assert_eq!(workspace.tabs.len(), 6);
+            assert_eq!(
+                workspace.tabs[workspace.active_tab_index].pane_group.id(),
+                id_active,
+                "active should still point at the original t5 after the run moved past it"
+            );
+            assert_eq!(workspace.active_tab_index, 3);
+        });
+    });
+}
+
+#[test]
 fn set_active_tab_index_force_expands_collapsed_member_group() {
     // PRODUCT §27/§28: activating a tab inside a collapsed group expands
     // the group as a side-effect of the activation, in the same call (no
