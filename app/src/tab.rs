@@ -626,6 +626,12 @@ pub struct TabComponent<'a> {
     tooltip_git_branch: Option<String>,
     is_drag_target: bool,
     background_opacity: u8,
+    /// Tab Group color (PRODUCT §18, §71-72). When set, the tab renders a
+    /// thin colored band along its bottom edge in the group's color.
+    /// Decorative — does not replace the per-tab indicator slot, and the
+    /// active-tab background still reads through the band. `None` when the
+    /// tab is ungrouped or `FeatureFlag::TabGroups` is off.
+    group_color: Option<crate::workspace::tab_group::TabGroupColor>,
 }
 
 /// Structure that holds TabComponent styles.
@@ -689,6 +695,7 @@ impl<'a> TabComponent<'a> {
         editor: ViewHandle<EditorView>,
         close_button_position: TabCloseButtonPosition,
         is_drag_target: bool,
+        group_color: Option<crate::workspace::tab_group::TabGroupColor>,
         ctx: &'a AppContext,
     ) -> Self {
         let appearance = Appearance::as_ref(ctx);
@@ -780,6 +787,7 @@ impl<'a> TabComponent<'a> {
             tooltip_git_branch,
             is_drag_target,
             background_opacity,
+            group_color,
         }
     }
 
@@ -1458,7 +1466,7 @@ impl<'a> TabComponent<'a> {
         }
 
         // If the tab is being dragged, add an opaque background behind it
-        if is_tab_dragging {
+        let tab_element: Box<dyn Element> = if is_tab_dragging {
             Container::new(tab.finish())
                 .with_background_color(
                     self.ui_builder
@@ -1475,6 +1483,23 @@ impl<'a> TabComponent<'a> {
                 },
             )
             .finish()
+        };
+
+        // Tab Groups (PRODUCT §18, §71-72): a thin colored band along the
+        // bottom edge of every member tab, in the group's palette color.
+        // Decorative — outer container so the band layers AROUND the
+        // existing active-styling border / background (which still reads
+        // through, per §71) and never replaces the per-tab indicator slot
+        // (per §72). Bottom edge chosen to avoid competing with the top-
+        // edge active-tab indicator and to survive `NewTabStyling`'s
+        // side-aware borders.
+        if let Some(group_color) = self.group_color {
+            let band_fill = group_color.to_fill(self.appearance.theme());
+            Container::new(tab_element)
+                .with_border(Border::bottom(2.).with_border_fill(band_fill))
+                .finish()
+        } else {
+            tab_element
         }
     }
 }

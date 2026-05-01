@@ -17081,6 +17081,18 @@ impl Workspace {
                 TabBarHoverIndex::BeforeTab(_) | TabBarHoverIndex::OverGroupChip(_) => false,
             });
 
+        // Tab Groups (PRODUCT §18, §71-72): hand the chip / band the
+        // group's color so it can render the bottom-edge band on this
+        // member tab. `None` when the tab is ungrouped or the feature
+        // flag is off — render falls back to the legacy un-banded tab.
+        let group_color = if FeatureFlag::TabGroups.is_enabled() {
+            tab.group_id
+                .and_then(|gid| self.tab_groups.get(gid))
+                .map(|group| group.color)
+        } else {
+            None
+        };
+
         TabComponent::new(
             tab_index,
             tab_bar_state,
@@ -17088,6 +17100,7 @@ impl Workspace {
             self.tab_rename_editor.clone(),
             close_button_position,
             is_drag_target,
+            group_color,
             ctx,
         )
         .build()
@@ -17670,7 +17683,15 @@ impl Workspace {
                 hover_fixed_width,
             };
 
-            for i in 0..self.tabs.len() {
+            // Tab Groups (PRODUCT §18-20, TECH.md §9.1): when the flag is
+            // on we walk the vector with a `while` loop so that on entering
+            // a group's contiguous run we can emit the chip first and then
+            // either skip past the run (collapsed) or render its members
+            // inline. With the flag off the loop is identical to the legacy
+            // `for i in 0..self.tabs.len()` shape.
+            let tab_groups_enabled = FeatureFlag::TabGroups.is_enabled();
+            let mut i = 0usize;
+            while i < self.tabs.len() {
                 // If we are hovered between two tabs, show the drop hover indicator
                 if self.hovered_tab_index.as_ref().is_some_and(
                     |hovered_index| match hovered_index {
@@ -17680,7 +17701,48 @@ impl Workspace {
                 ) {
                     tab_bar.add_child(self.render_tab_hover_indicator(appearance));
                 }
+
+                // Defensive: only consult the registry when the feature
+                // flag is on so we never accidentally render chip chrome
+                // in a build where Tab Groups is disabled.
+                let group_id = if tab_groups_enabled {
+                    self.tabs[i].group_id
+                } else {
+                    None
+                };
+                if let Some(gid) = group_id {
+                    let run = self.group_member_range(gid);
+                    // First member of the run (PRODUCT §5 / I1 contiguity):
+                    // emit the chip, then skip-or-fall-through.
+                    if i == run.start {
+                        if let Some(group) = self.tab_groups.get(gid) {
+                            let member_count = run.end - run.start;
+                            let is_active_member =
+                                (run.start..run.end).contains(&self.active_tab_index);
+                            tab_bar.add_child(
+                                crate::workspace::tab_group::chip::render_tab_group_chip(
+                                    group,
+                                    member_count,
+                                    is_active_member,
+                                    appearance,
+                                    ctx,
+                                ),
+                            );
+                            // Collapsed group hides its member tabs from
+                            // the bar (PRODUCT §19, §26). Active-member
+                            // pinning (I3) is enforced at the workspace
+                            // layer; we still defensively jump past the
+                            // run here so the bar reflects the registry
+                            // state in the same frame.
+                            if group.collapsed {
+                                i = run.end;
+                                continue;
+                            }
+                        }
+                    }
+                }
                 tab_bar.add_child(self.render_tab_in_tab_bar(i, tab_bar_state, ctx));
+                i += 1;
             }
 
             // Fencepost problem - add the indicator at the end if needed
