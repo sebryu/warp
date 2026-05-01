@@ -794,6 +794,10 @@ pub enum FeatureFlag {
     /// Enables tab configs — user-definable TOML templates for launching custom tab layouts.
     TabConfigs,
 
+    /// Enables Chrome-like Tab Groups: window-local containers with name, color,
+    /// collapse/expand, and contiguous member tabs. See specs/tab-groups/.
+    TabGroups,
+
     /// When enabled, free-tier users are blocked from AI features (no-AI experiment arm).
     FreeUserNoAi,
 
@@ -923,6 +927,7 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     #[cfg(not(windows))]
     FeatureFlag::SshRemoteServer,
     FeatureFlag::CloudModeInputV2,
+    FeatureFlag::TabGroups,
 ];
 
 /// Features enabled for feature preview build users (e.g.: Friends of Warp).

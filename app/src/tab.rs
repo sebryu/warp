@@ -109,6 +109,26 @@ pub enum TabTelemetryAction {
     CloseTabsToRight,
     SetColor,
     ResetColor,
+    // ── Tab Groups (gated by FeatureFlag::TabGroups via the action paths). ──
+    CreateGroup,
+    RenameGroup,
+    RecolorGroup,
+    CollapseGroup,
+    ExpandGroup,
+    /// Add tab to group via right-click menu (PRODUCT §31).
+    AddTabToGroupByMenu,
+    /// Add tab to group via drag-drop (PRODUCT §33).
+    AddTabToGroupByDrag,
+    /// Remove tab from group via right-click menu (PRODUCT §35).
+    RemoveTabFromGroupByMenu,
+    /// Remove tab from group via drag out of run (PRODUCT §36).
+    RemoveTabFromGroupByDrag,
+    /// Source-side strip of group_id during cross-window handoff (TECH.md §11.5).
+    HandoffRemoveFromGroup,
+    /// Dissolve group via Ungroup menu item (PRODUCT §30).
+    UngroupGroup,
+    /// Close every member of a group (PRODUCT §42).
+    CloseGroup,
 }
 #[derive(Debug, Clone)]
 pub enum NewSessionMenuItem {
@@ -144,6 +164,10 @@ pub struct TabData {
     pub indicator_hover_state: MouseStateHandle,
     // Used by a later drag-tab branch to distinguish tabs that have moved into detached windows.
     pub detached: bool,
+    /// Tab Group membership (PRODUCT §2). `None` means the tab is ungrouped.
+    /// All mutation goes through `Workspace` so the contiguity / non-empty
+    /// invariants in TECH.md §7 are preserved.
+    pub group_id: Option<crate::workspace::tab_group::TabGroupId>,
 }
 
 const TAB_COLOR_ICON_PATH: &str = "bundled/svg/ellipse.svg";
@@ -161,6 +185,7 @@ impl TabData {
             selected_color: SelectedTabColor::Unset,
             indicator_hover_state: Default::default(),
             detached: false,
+            group_id: None,
         }
     }
 

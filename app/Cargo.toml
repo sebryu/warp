@@ -617,6 +617,7 @@ default = [
     "cli_agent_rich_input",
     "vertical_tabs",
     "tab_configs",
+    "tab_groups",
     "hoa_onboarding_flow",
     "hoa_remote_control",
     "codex_notifications",
@@ -913,6 +914,7 @@ hoa_code_review = []
 vertical_tabs = []
 vertical_tabs_summary_mode = []
 tab_configs = []
+tab_groups = []
 agent_harness = []
 oz_handoff = []
 hoa_notifications = []

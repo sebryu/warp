@@ -73,7 +73,7 @@ use crate::ai::persisted_workspace::EnablementState;
 use crate::app_state::{
     AIFactPaneSnapshot, AmbientAgentPaneSnapshot, CodeReviewPaneSnapshot,
     EnvVarCollectionPaneSnapshot, LeftPanelSnapshot, RightPanelSnapshot, SettingsPaneSnapshot,
-    WorkflowPaneSnapshot,
+    TabGroupSnapshot, WorkflowPaneSnapshot,
 };
 use crate::auth::auth_manager::PersistedCurrentUserInformation;
 use crate::auth::auth_state::AuthStateProvider;
@@ -825,6 +825,7 @@ fn save_app_state(conn: &mut SqliteConnection, app_state: &AppState) -> Result<(
         diesel::delete(schema::pane_leaves::dsl::pane_leaves).execute(conn)?;
         diesel::delete(schema::pane_branches::dsl::pane_branches).execute(conn)?;
         diesel::delete(schema::pane_nodes::dsl::pane_nodes).execute(conn)?;
+        diesel::delete(schema::tab_groups::dsl::tab_groups).execute(conn)?;
         diesel::delete(schema::tabs::dsl::tabs).execute(conn)?;
         diesel::delete(schema::windows::dsl::windows).execute(conn)?;
         diesel::delete(schema::active_mcp_servers::dsl::active_mcp_servers).execute(conn)?;
@@ -888,6 +889,31 @@ fn save_app_state(conn: &mut SqliteConnection, app_state: &AppState) -> Result<(
                 active_window_id = Some(window_id)
             }
 
+            // Tab Groups (PRODUCT §55-58): persist per-window registry. We
+            // emit only groups whose ID is referenced by at least one tab
+            // (PRODUCT §56 / TECH.md §6.6 — empty groups are dropped at
+            // write time as well as at read time).
+            let referenced_group_ids: std::collections::HashSet<
+                crate::workspace::tab_group::TabGroupId,
+            > = window.tabs.iter().filter_map(|t| t.group_id).collect();
+            let group_rows: Vec<model::NewTabGroupRow> = window
+                .tab_groups
+                .iter()
+                .filter(|g| referenced_group_ids.contains(&g.id))
+                .map(|g| model::NewTabGroupRow {
+                    uuid: g.id.0.to_string(),
+                    window_id,
+                    name: g.name.clone(),
+                    color: serde_yaml::to_string(&g.color).unwrap_or_default(),
+                    is_collapsed: g.collapsed,
+                })
+                .collect();
+            if !group_rows.is_empty() {
+                diesel::insert_into(schema::tab_groups::dsl::tab_groups)
+                    .values(group_rows)
+                    .execute(conn)?;
+            }
+
             let tabs: Vec<NewTab> = window
                 .tabs
                 .iter()
@@ -901,6 +927,7 @@ fn save_app_state(conn: &mut SqliteConnection, app_state: &AppState) -> Result<(
                         SelectedTabColor::Unset => None,
                         _ => serde_yaml::to_string(&tab.selected_color).ok(),
                     },
+                    group_uuid: tab.group_id.map(|g| g.0.to_string()),
                 })
                 .collect();
 
@@ -2667,6 +2694,10 @@ fn read_sqlite_data(
         .load::<Tab>(conn)?
         .grouped_by(&db_windows);
 
+    let db_tab_groups = model::TabGroupRow::belonging_to(&db_windows)
+        .load::<model::TabGroupRow>(conn)?
+        .grouped_by(&db_windows);
+
     let db_panels = schema::panels::dsl::panels
         .load::<model::Panel>(conn)?
         .into_iter()
@@ -2677,8 +2708,9 @@ fn read_sqlite_data(
         .into_iter()
         .enumerate()
         .zip(db_tabs)
-        .map(|((idx, window), tabs_for_window)| {
-            let saved_tabs: Vec<_> = tabs_for_window
+        .zip(db_tab_groups)
+        .map(|(((idx, window), tabs_for_window), groups_for_window)| {
+            let mut saved_tabs: Vec<_> = tabs_for_window
                 .into_iter()
                 .filter_map(|tab| {
                     let root = read_root_node(conn, tab.id).ok()?;
@@ -2691,6 +2723,12 @@ fn read_sqlite_data(
                     let right_panel = panel
                         .and_then(|p| p.right_panel.as_ref())
                         .and_then(|s| serde_json::from_str::<RightPanelSnapshot>(s).ok());
+
+                    let group_id = tab
+                        .group_uuid
+                        .as_deref()
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                        .map(crate::workspace::tab_group::TabGroupId);
 
                     Some(TabSnapshot {
                         root,
@@ -2712,9 +2750,42 @@ fn read_sqlite_data(
                             .unwrap_or_default(),
                         left_panel,
                         right_panel,
+                        group_id,
                     })
                 })
                 .collect();
+
+            // Hydrate per-window tab groups (TECH.md §6.5).
+            let mut tab_groups_for_window: Vec<TabGroupSnapshot> = groups_for_window
+                .into_iter()
+                .filter_map(|row| {
+                    let parsed_uuid = Uuid::parse_str(&row.uuid).ok()?;
+                    let color = serde_yaml::from_str(&row.color).ok()?;
+                    Some(TabGroupSnapshot {
+                        id: crate::workspace::tab_group::TabGroupId(parsed_uuid),
+                        name: row.name,
+                        color,
+                        collapsed: row.is_collapsed,
+                    })
+                })
+                .collect();
+
+            // PRODUCT §56 + TECH.md §6.6: drop empty groups, clear dangling
+            // group_uuid references on tabs.
+            let referenced: std::collections::HashSet<crate::workspace::tab_group::TabGroupId> =
+                saved_tabs.iter().filter_map(|t| t.group_id).collect();
+            tab_groups_for_window.retain(|g| referenced.contains(&g.id));
+            let valid_ids: std::collections::HashSet<crate::workspace::tab_group::TabGroupId> =
+                tab_groups_for_window.iter().map(|g| g.id).collect();
+            for t in saved_tabs.iter_mut() {
+                if let Some(group_id) = t.group_id {
+                    if !valid_ids.contains(&group_id) {
+                        t.group_id = None;
+                    }
+                }
+            }
+            // Stable order for round-trip equality in tests.
+            tab_groups_for_window.sort_by_key(|g| g.id.0.as_bytes().to_owned());
 
             if active_window_id
                 .map(|window_id| window.id == window_id)
@@ -2725,6 +2796,18 @@ fn read_sqlite_data(
 
             // Default active tab index to 0 if we overflow when converting.
             let tab_index: usize = window.active_tab_index.try_into().unwrap_or(0);
+
+            // PRODUCT §57: if the active tab is a member of a group persisted
+            // as collapsed, force-expand on restore so the active tab stays
+            // visible after restart.
+            if let Some(active_group_id) = saved_tabs.get(tab_index).and_then(|t| t.group_id) {
+                if let Some(g) = tab_groups_for_window
+                    .iter_mut()
+                    .find(|g| g.id == active_group_id)
+                {
+                    g.collapsed = false;
+                }
+            }
 
             let fullscreen_state_val =
                 FullscreenState::from_i32(window.fullscreen_state).unwrap_or_default();
@@ -2797,6 +2880,7 @@ fn read_sqlite_data(
                 agent_management_filters: window
                     .agent_management_filters
                     .and_then(|s| serde_json::from_str(&s).ok()),
+                tab_groups: tab_groups_for_window,
             }
         })
         .collect();

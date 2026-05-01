@@ -139,6 +139,7 @@ fn test_terminal_window_snapshot(vertical_tabs_panel_open: bool) -> WindowSnapsh
             selected_color: SelectedTabColor::default(),
             left_panel: None,
             right_panel: None,
+            group_id: None,
         }],
         active_tab_index: 0,
         bounds: None,
@@ -153,6 +154,7 @@ fn test_terminal_window_snapshot(vertical_tabs_panel_open: bool) -> WindowSnapsh
         left_panel_width: None,
         right_panel_width: None,
         agent_management_filters: None,
+        tab_groups: Vec::new(),
     }
 }
 
@@ -222,6 +224,7 @@ fn test_sqlite_round_trips_custom_vertical_tabs_title() {
                 selected_color: SelectedTabColor::default(),
                 left_panel: None,
                 right_panel: None,
+                group_id: None,
             }],
             active_tab_index: 0,
             bounds: None,
@@ -236,6 +239,7 @@ fn test_sqlite_round_trips_custom_vertical_tabs_title() {
             left_panel_width: None,
             right_panel_width: None,
             agent_management_filters: None,
+            tab_groups: Vec::new(),
         }],
         active_window_index: Some(0),
         block_lists: Default::default(),
@@ -294,6 +298,7 @@ fn test_sqlite_round_trips_code_pane_with_multiple_tabs() {
                 selected_color: SelectedTabColor::default(),
                 left_panel: None,
                 right_panel: None,
+                group_id: None,
             }],
             active_tab_index: 0,
             bounds: None,
@@ -308,6 +313,7 @@ fn test_sqlite_round_trips_code_pane_with_multiple_tabs() {
             left_panel_width: None,
             right_panel_width: None,
             agent_management_filters: None,
+            tab_groups: Vec::new(),
         }],
         active_window_index: Some(0),
         block_lists: Default::default(),
@@ -414,4 +420,213 @@ fn test_deserialize_corrupted_guests() {
             guests: vec![],
         })
     );
+}
+
+// ── Tab Groups round-trip tests (TECH.md §14.2) ────────────────────────────
+
+mod tab_groups {
+    use super::*;
+    use crate::app_state::TabGroupSnapshot;
+    use crate::workspace::tab_group::{TabGroupColor, TabGroupId};
+
+    fn terminal_tab(uuid: u8, group_id: Option<TabGroupId>) -> TabSnapshot {
+        TabSnapshot {
+            custom_title: None,
+            root: PaneNodeSnapshot::Leaf(LeafSnapshot {
+                is_focused: true,
+                custom_vertical_tabs_title: None,
+                contents: LeafContents::Terminal(TerminalPaneSnapshot {
+                    uuid: vec![uuid],
+                    cwd: Some("/tmp".to_string()),
+                    shell_launch_data: Some(ShellLaunchData::Executable {
+                        executable_path: PathBuf::from("/bin/zsh"),
+                        shell_type: crate::terminal::shell::ShellType::Zsh,
+                    }),
+                    is_active: true,
+                    is_read_only: false,
+                    input_config: None,
+                    llm_model_override: None,
+                    active_profile_id: None,
+                    conversation_ids_to_restore: vec![],
+                    active_conversation_id: None,
+                }),
+            }),
+            default_directory_color: None,
+            selected_color: SelectedTabColor::default(),
+            left_panel: None,
+            right_panel: None,
+            group_id,
+        }
+    }
+
+    fn window(
+        active_tab_index: usize,
+        tabs: Vec<TabSnapshot>,
+        tab_groups: Vec<TabGroupSnapshot>,
+    ) -> WindowSnapshot {
+        WindowSnapshot {
+            tabs,
+            active_tab_index,
+            bounds: None,
+            fullscreen_state: Default::default(),
+            quake_mode: false,
+            universal_search_width: None,
+            warp_ai_width: None,
+            voltron_width: None,
+            warp_drive_index_width: None,
+            left_panel_open: false,
+            vertical_tabs_panel_open: false,
+            left_panel_width: None,
+            right_panel_width: None,
+            agent_management_filters: None,
+            tab_groups,
+        }
+    }
+
+    fn save_and_reload(app_state: AppState) -> AppState {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let database_path = tempdir.path().join("warp.sqlite");
+        let mut conn = setup_database(&database_path).expect("database should initialize");
+        save_app_state(&mut conn, &app_state).expect("app state should save");
+        read_sqlite_data(&mut conn, None)
+            .expect("app state should load")
+            .app_state
+    }
+
+    /// Round-trip a workspace containing two groups; assert membership and
+    /// per-group fields are restored.
+    #[test]
+    fn persistence_round_trip_tab_groups_basic() {
+        let g1 = TabGroupId::new();
+        let g2 = TabGroupId::new();
+        let app_state = AppState {
+            windows: vec![window(
+                0,
+                vec![
+                    terminal_tab(1, Some(g1)),
+                    terminal_tab(2, Some(g1)),
+                    terminal_tab(3, None),
+                    terminal_tab(4, Some(g2)),
+                ],
+                vec![
+                    TabGroupSnapshot {
+                        id: g1,
+                        name: "Deploy".into(),
+                        color: TabGroupColor::Blue,
+                        collapsed: false,
+                    },
+                    TabGroupSnapshot {
+                        id: g2,
+                        name: "Investigate".into(),
+                        color: TabGroupColor::Red,
+                        collapsed: false,
+                    },
+                ],
+            )],
+            active_window_index: Some(0),
+            block_lists: Default::default(),
+            running_mcp_servers: Default::default(),
+        };
+        let restored = save_and_reload(app_state);
+        let win = &restored.windows[0];
+        assert_eq!(win.tab_groups.len(), 2);
+        // Order is sorted by UUID bytes; just verify both groups present.
+        let by_id: std::collections::HashMap<_, _> =
+            win.tab_groups.iter().map(|g| (g.id, g)).collect();
+        assert_eq!(by_id[&g1].name, "Deploy");
+        assert_eq!(by_id[&g1].color, TabGroupColor::Blue);
+        assert_eq!(by_id[&g2].name, "Investigate");
+        assert_eq!(win.tabs[0].group_id, Some(g1));
+        assert_eq!(win.tabs[1].group_id, Some(g1));
+        assert_eq!(win.tabs[2].group_id, None);
+        assert_eq!(win.tabs[3].group_id, Some(g2));
+    }
+
+    /// PRODUCT §57: collapsed group whose member is the active tab is
+    /// force-expanded on load so the active tab stays visible.
+    #[test]
+    fn persistence_round_trip_active_member_force_expands_on_load() {
+        let g = TabGroupId::new();
+        let app_state = AppState {
+            windows: vec![window(
+                /* active = first member of g */ 0,
+                vec![terminal_tab(1, Some(g)), terminal_tab(2, None)],
+                vec![TabGroupSnapshot {
+                    id: g,
+                    name: "Active group".into(),
+                    color: TabGroupColor::Green,
+                    collapsed: true,
+                }],
+            )],
+            active_window_index: Some(0),
+            block_lists: Default::default(),
+            running_mcp_servers: Default::default(),
+        };
+        let restored = save_and_reload(app_state);
+        let win = &restored.windows[0];
+        assert_eq!(win.tab_groups.len(), 1);
+        assert!(
+            !win.tab_groups[0].collapsed,
+            "collapsed group with active member must expand on load (PRODUCT §57)"
+        );
+    }
+
+    /// PRODUCT §57 negative case: collapsed group whose member is *not* the
+    /// active tab stays collapsed across save/load.
+    #[test]
+    fn persistence_round_trip_collapsed_state_preserved_when_not_active() {
+        let g = TabGroupId::new();
+        let app_state = AppState {
+            windows: vec![window(
+                /* active = ungrouped tab at index 1 */ 1,
+                vec![terminal_tab(1, Some(g)), terminal_tab(2, None)],
+                vec![TabGroupSnapshot {
+                    id: g,
+                    name: "Sleeping group".into(),
+                    color: TabGroupColor::Cyan,
+                    collapsed: true,
+                }],
+            )],
+            active_window_index: Some(0),
+            block_lists: Default::default(),
+            running_mcp_servers: Default::default(),
+        };
+        let restored = save_and_reload(app_state);
+        let win = &restored.windows[0];
+        assert_eq!(win.tab_groups.len(), 1);
+        assert!(
+            win.tab_groups[0].collapsed,
+            "collapsed group should round-trip when active tab is elsewhere"
+        );
+    }
+
+    /// PRODUCT §56 / TECH.md §6.6: empty groups (no referencing tab) are
+    /// dropped at write time, and on read the `tabs.group_uuid` pointing at
+    /// a now-missing group is cleared.
+    #[test]
+    fn persistence_round_trip_drops_orphan_group_at_write_time() {
+        let g = TabGroupId::new();
+        let app_state = AppState {
+            windows: vec![window(
+                0,
+                vec![terminal_tab(1, None)], // no tab references the group
+                vec![TabGroupSnapshot {
+                    id: g,
+                    name: "ghost".into(),
+                    color: TabGroupColor::Yellow,
+                    collapsed: false,
+                }],
+            )],
+            active_window_index: Some(0),
+            block_lists: Default::default(),
+            running_mcp_servers: Default::default(),
+        };
+        let restored = save_and_reload(app_state);
+        let win = &restored.windows[0];
+        assert!(
+            win.tab_groups.is_empty(),
+            "empty group must be dropped at write time (PRODUCT §56)"
+        );
+        assert_eq!(win.tabs[0].group_id, None);
+    }
 }

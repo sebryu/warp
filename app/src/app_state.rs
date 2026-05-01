@@ -20,6 +20,7 @@ use crate::settings_view::{environments_page::EnvironmentsPage, SettingsSection}
 use crate::tab::SelectedTabColor;
 use crate::terminal::ShellLaunchData;
 use crate::themes::theme::AnsiColorIdentifier;
+use crate::workspace::tab_group::{TabGroupColor, TabGroupId};
 use crate::workspace::view::left_panel::ToolPanelView;
 use crate::workspace::Workspace;
 
@@ -56,6 +57,19 @@ pub struct WindowSnapshot {
     pub left_panel_width: Option<f32>,
     pub right_panel_width: Option<f32>,
     pub agent_management_filters: Option<PersistedAgentManagementFilters>,
+    /// Tab groups owned by this window. See `specs/tab-groups/TECH.md` §6.
+    pub tab_groups: Vec<TabGroupSnapshot>,
+}
+
+/// Persisted form of a single Tab Group. Order in the `Vec` is irrelevant for
+/// correctness; for stable equality in tests, sort by `id` UUID bytes when
+/// constructing the snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabGroupSnapshot {
+    pub id: TabGroupId,
+    pub name: String,
+    pub color: TabGroupColor,
+    pub collapsed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +80,8 @@ pub struct TabSnapshot {
     pub selected_color: SelectedTabColor,
     pub left_panel: Option<LeftPanelSnapshot>,
     pub right_panel: Option<RightPanelSnapshot>,
+    /// Group membership, by stable UUID. `None` for ungrouped tabs.
+    pub group_id: Option<TabGroupId>,
 }
 
 impl TabSnapshot {

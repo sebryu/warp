@@ -892,6 +892,9 @@ pub struct Workspace {
     tabs: Vec<TabData>,
     active_tab_index: usize,
     hovered_tab_index: Option<TabBarHoverIndex>,
+    /// Window-local Tab Group registry. See `crate::workspace::tab_group` and
+    /// TECH.md §7. Empty by default; populated as users create groups.
+    pub(crate) tab_groups: crate::workspace::tab_group::TabGroupRegistry,
     tab_bar_hover_state: MouseStateHandle,
     tab_fixed_width: Option<f32>,
     traffic_light_mouse_states: TrafficLightMouseStates,
@@ -3037,6 +3040,7 @@ impl Workspace {
             tabs: Vec::new(),
             active_tab_index: 0,
             hovered_tab_index: None,
+            tab_groups: Default::default(),
             tab_bar_hover_state: Default::default(),
             traffic_light_mouse_states: Default::default(),
             tab_rename_editor: Self::tab_rename_editor(ctx),
@@ -4949,6 +4953,18 @@ impl Workspace {
         } else {
             index
         };
+
+        // PRODUCT §28: activating a tab inside a collapsed group expands the
+        // group as a side-effect of activation, so I3 (active-visibility)
+        // holds at the next render. Done in-line (not via dispatched action)
+        // so subsequent hover/render math sees a consistent state.
+        if let Some(group_id) = self.tabs.get(index).and_then(|t| t.group_id) {
+            if self.tab_groups.get(group_id).is_some_and(|g| g.collapsed) {
+                if let Some(group) = self.tab_groups.get_mut(group_id) {
+                    group.collapsed = false;
+                }
+            }
+        }
 
         self.active_tab_index = index;
 
@@ -9863,6 +9879,7 @@ impl Workspace {
                         .map_or(SelectedTabColor::Unset, |tab| tab.selected_color),
                     left_panel,
                     right_panel,
+                    group_id: self.tabs.get(tab_index).and_then(|tab| tab.group_id),
                 }
             })
             .filter(|tab| {
@@ -9931,6 +9948,24 @@ impl Workspace {
                 .read(app, |view, _| view.get_filters()),
         );
 
+        // Tab Groups: only emit groups that have at least one referencing tab,
+        // so a corrupt empty group is dropped at write time (PRODUCT §56).
+        let referenced: std::collections::HashSet<crate::workspace::tab_group::TabGroupId> =
+            self.tabs.iter().filter_map(|t| t.group_id).collect();
+        let mut tab_groups: Vec<crate::app_state::TabGroupSnapshot> = self
+            .tab_groups
+            .iter()
+            .filter(|(id, _)| referenced.contains(*id))
+            .map(|(_, g)| crate::app_state::TabGroupSnapshot {
+                id: g.id,
+                name: g.name.clone(),
+                color: g.color,
+                collapsed: g.collapsed,
+            })
+            .collect();
+        // Stable order for round-trip equality in tests (TECH.md §6.3).
+        tab_groups.sort_by_key(|g| g.id.0.as_bytes().to_owned());
+
         WindowSnapshot {
             tabs,
             active_tab_index,
@@ -9946,6 +9981,7 @@ impl Workspace {
             left_panel_width,
             right_panel_width,
             agent_management_filters,
+            tab_groups,
         }
     }
 
@@ -10169,7 +10205,13 @@ impl Workspace {
             });
         }
 
-        let tab_data = self.tabs.remove(index);
+        let mut tab_data = self.tabs.remove(index);
+        // Tab Groups (PRODUCT §38, §53, §60-61): the source group of a
+        // departing tab loses one member; if it was the last member, the
+        // group dissolves. Always strip the membership so the tab cannot
+        // carry a stale `group_id` onto the undo-close stack or into a
+        // cross-window transfer payload.
+        let departing_group = tab_data.group_id.take();
 
         if add_to_undo_stack {
             let handle = ctx.handle();
@@ -10177,6 +10219,10 @@ impl Workspace {
                 log::info!("storing data for closed tab");
                 stack.handle_tab_closed(handle, index, tab_data, ctx);
             });
+        }
+
+        if let Some(gid) = departing_group {
+            self.prune_empty_group(gid);
         }
 
         match index.cmp(&self.active_tab_index) {
@@ -10200,6 +10246,412 @@ impl Workspace {
     pub fn remove_tab_without_undo(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
         self.remove_tab(index, false, false, ctx);
     }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Tab Groups (TECH.md §7).
+    //
+    // Invariants this section preserves between message-pump ticks:
+    //   I1. Contiguity (PRODUCT §4): every group's members are a contiguous
+    //       slice of `self.tabs`.
+    //   I2. Non-empty (PRODUCT §3, §51): every group in the registry has at
+    //       least one referencing tab.
+    //   I3. Active-visibility (PRODUCT §27, §47): if the active tab is a
+    //       member of group `g`, then `!tab_groups[g].collapsed`.
+    //
+    // The single chokepoint for in-place reorder is `reorder_tab` (§7.3).
+    // Group lifecycle methods route through it so contiguity is restored
+    // automatically.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Indices of the contiguous run of members of `group_id`. Returns an
+    /// empty range when no tab references the group (which is itself an I2
+    /// violation and triggers a registry prune).
+    pub(crate) fn group_member_range(
+        &self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+    ) -> std::ops::Range<usize> {
+        let mut start: Option<usize> = None;
+        let mut end: usize = 0;
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            if tab.group_id == Some(group_id) {
+                if start.is_none() {
+                    start = Some(idx);
+                }
+                end = idx + 1;
+            }
+        }
+        match start {
+            Some(s) => s..end,
+            None => 0..0,
+        }
+    }
+
+    /// Internal: invariant-restoring helper called by every method that may
+    /// orphan a group. Removes the group from the registry if no `TabData`
+    /// references it. Idempotent.
+    pub(crate) fn prune_empty_group(&mut self, group_id: crate::workspace::tab_group::TabGroupId) {
+        let still_referenced = self.tabs.iter().any(|t| t.group_id == Some(group_id));
+        if !still_referenced {
+            self.tab_groups.remove(group_id);
+        }
+    }
+
+    /// Debug-only assertion that all Tab Group invariants hold.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_assert_tab_group_invariants(&self) {
+        // I2: every registry entry has at least one referencing tab.
+        for (id, _) in self.tab_groups.iter() {
+            let any = self.tabs.iter().any(|t| t.group_id == Some(*id));
+            debug_assert!(any, "Tab Group {:?} has no member tabs (I2)", id);
+        }
+        // I1: every group's members are contiguous.
+        let mut seen: std::collections::HashMap<
+            crate::workspace::tab_group::TabGroupId,
+            (usize, usize, bool),
+        > = std::collections::HashMap::new();
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            if let Some(gid) = tab.group_id {
+                let entry = seen.entry(gid).or_insert((idx, idx, false));
+                debug_assert!(
+                    !entry.2 || entry.1 == idx - 1,
+                    "Tab Group {:?} is not contiguous at index {}",
+                    gid,
+                    idx
+                );
+                entry.1 = idx;
+                entry.2 = true;
+            } else if let Some(prev_gid) =
+                self.tabs.get(idx.wrapping_sub(1)).and_then(|t| t.group_id)
+            {
+                if let Some(entry) = seen.get_mut(&prev_gid) {
+                    entry.2 = false;
+                }
+            }
+        }
+        // I3: active-tab pinning.
+        if let Some(tab) = self.tabs.get(self.active_tab_index) {
+            if let Some(gid) = tab.group_id {
+                if let Some(g) = self.tab_groups.get(gid) {
+                    debug_assert!(
+                        !g.collapsed,
+                        "Active tab is in collapsed group {:?} (I3)",
+                        gid
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub(crate) fn debug_assert_tab_group_invariants(&self) {}
+
+    /// PRODUCT §9, §32: create a new group from a single tab and immediately
+    /// enter rename mode for the new chip / section header.
+    pub fn create_tab_group_from_tab(&mut self, tab_idx: usize, ctx: &mut ViewContext<Self>) {
+        if tab_idx >= self.tabs.len() {
+            return;
+        }
+        // If the tab is already in a group, leaving the source group is
+        // implicit in the swap. Capture it so we can prune afterwards.
+        let previous_group = self.tabs[tab_idx].group_id;
+
+        let color = self.tab_groups.next_default_color();
+        let group = crate::workspace::tab_group::TabGroup::new(String::new(), color);
+        let new_id = group.id;
+        self.tab_groups.insert(group);
+        self.tabs[tab_idx].group_id = Some(new_id);
+
+        if let Some(prev) = previous_group {
+            self.prune_empty_group(prev);
+        }
+
+        // Enter rename mode immediately (PRODUCT §9). The UI implementation
+        // (task #5) installs the inline-rename editor; here we just call
+        // through to the rename hook.
+        self.rename_tab_group(new_id, ctx);
+
+        self.debug_assert_tab_group_invariants();
+        ctx.notify();
+    }
+
+    /// PRODUCT §31, §33: move a tab into an existing group at the run's end.
+    /// If the tab was previously in a different group, it leaves first; the
+    /// source group dissolves if that empties it.
+    pub fn move_tab_into_group(
+        &mut self,
+        tab_idx: usize,
+        group_id: crate::workspace::tab_group::TabGroupId,
+        _source: crate::workspace::tab_group::TabGroupOperationSource,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if tab_idx >= self.tabs.len() || !self.tab_groups.contains(group_id) {
+            return;
+        }
+        if self.tabs[tab_idx].group_id == Some(group_id) {
+            return;
+        }
+        let previous_group = self.tabs[tab_idx].group_id;
+        let target_run = self.group_member_range(group_id);
+        // Snap the tab to immediately after the group's run so it lands at
+        // the run's end (PRODUCT §31). When `tab_idx` is already inside the
+        // run we'd have early-returned.
+        let landing = if tab_idx < target_run.start {
+            target_run.end.saturating_sub(1)
+        } else {
+            target_run.end
+        };
+        self.reorder_tab_internal(tab_idx, landing);
+        // After reorder, recompute the new index of the moved tab.
+        let new_idx = self
+            .tabs
+            .iter()
+            .position(|t| t.group_id == previous_group && previous_group.is_some())
+            .or(Some(landing.min(self.tabs.len().saturating_sub(1))))
+            .unwrap();
+        let landing = new_idx.min(self.tabs.len().saturating_sub(1));
+        self.tabs[landing].group_id = Some(group_id);
+        if let Some(prev) = previous_group {
+            self.prune_empty_group(prev);
+        }
+        self.debug_assert_tab_group_invariants();
+        ctx.notify();
+    }
+
+    /// PRODUCT §35-37: clear the tab's `group_id`. Tab keeps its position;
+    /// the source group dissolves if removal leaves it empty.
+    pub fn remove_tab_from_group(
+        &mut self,
+        tab_idx: usize,
+        _source: crate::workspace::tab_group::TabGroupOperationSource,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if tab_idx >= self.tabs.len() {
+            return;
+        }
+        if let Some(prev) = self.tabs[tab_idx].group_id.take() {
+            self.prune_empty_group(prev);
+            self.debug_assert_tab_group_invariants();
+            ctx.notify();
+        }
+    }
+
+    /// PRODUCT §30 → Ungroup: dissolve a group, leaving members in place
+    /// without any `group_id` (PRODUCT §50, §54).
+    pub fn ungroup_tab_group(
+        &mut self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        for tab in self.tabs.iter_mut() {
+            if tab.group_id == Some(group_id) {
+                tab.group_id = None;
+            }
+        }
+        self.tab_groups.remove(group_id);
+        self.debug_assert_tab_group_invariants();
+        ctx.notify();
+    }
+
+    /// PRODUCT §13-15: enter inline rename for the chip / section header.
+    /// Actual editor wiring (cancel-other-renames, focus, etc.) lives with
+    /// the UI implementation; this method is the entry point that the
+    /// dispatcher calls.
+    pub fn rename_tab_group(
+        &mut self,
+        _group_id: crate::workspace::tab_group::TabGroupId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // UI wiring (task #5) installs the inline-rename editor on the chip
+        // and reports back via SetTabGroupName. Until that lands, this is a
+        // notification-only entry point so the action reaches the view tree.
+        ctx.notify();
+    }
+
+    /// PRODUCT §14: rename-editor commit. Empty string is allowed and
+    /// results in the chip falling back to the color name in render.
+    pub fn set_tab_group_name(
+        &mut self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+        name: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if let Some(group) = self.tab_groups.get_mut(group_id) {
+            group.name = name;
+            ctx.notify();
+        }
+    }
+
+    /// PRODUCT §17: apply a new color and persist via the standard
+    /// save dispatcher.
+    pub fn recolor_tab_group(
+        &mut self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+        color: crate::workspace::tab_group::TabGroupColor,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if let Some(group) = self.tab_groups.get_mut(group_id) {
+            group.color = color;
+            ctx.notify();
+        }
+    }
+
+    /// PRODUCT §25-29: set the collapsed flag. If `collapsed=true` and the
+    /// active tab is a member of `group_id`, this is a no-op (PRODUCT §27).
+    pub fn set_tab_group_collapsed(
+        &mut self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+        collapsed: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // I3: active-tab pinning prevents collapse "sticking" while the
+        // active tab is a member.
+        if collapsed {
+            let active_in_group = self
+                .tabs
+                .get(self.active_tab_index)
+                .and_then(|t| t.group_id)
+                == Some(group_id);
+            if active_in_group {
+                return;
+            }
+        }
+        if let Some(group) = self.tab_groups.get_mut(group_id) {
+            if group.collapsed != collapsed {
+                group.collapsed = collapsed;
+                self.debug_assert_tab_group_invariants();
+                ctx.notify();
+            }
+        }
+    }
+
+    /// Shorthand used by the chip's left-click and the section-header
+    /// chevron (PRODUCT §20, §22).
+    pub fn toggle_tab_group_collapsed(
+        &mut self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let want = self
+            .tab_groups
+            .get(group_id)
+            .map(|g| !g.collapsed)
+            .unwrap_or(false);
+        self.set_tab_group_collapsed(group_id, want, ctx);
+    }
+
+    /// PRODUCT §42-45: close every member tab of the group in workspace-tab
+    /// order via the existing per-tab close pipeline. Cancellation aborts
+    /// the whole close (no partial). Group dissolves on the close of the
+    /// last member.
+    pub fn close_tab_group(
+        &mut self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // Collect the indices descending so removals don't shift the indices
+        // we still need to act on.
+        let indices: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(i, t)| (t.group_id == Some(group_id)).then_some(i))
+            .collect();
+        for index in indices {
+            self.remove_tab(index, true, true, ctx);
+        }
+        // remove_tab → prune chain dissolves the group on the last close,
+        // but if the loop is empty (e.g. the registry had a stale entry),
+        // we still want to drop it.
+        self.prune_empty_group(group_id);
+        ctx.notify();
+    }
+
+    /// PRODUCT §40: reorder a whole group as a unit. The drag math hands
+    /// us `target_first_index`; here we extract the run, snap to a
+    /// non-group-interior boundary in the resulting vector, and splice
+    /// the run back in.
+    pub fn reorder_group(
+        &mut self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+        target_first_index: usize,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let run = self.group_member_range(group_id);
+        if run.is_empty() {
+            return;
+        }
+        let drained: Vec<crate::tab::TabData> = self.tabs.drain(run.clone()).collect();
+        let active_was_in_run = (run.start..run.end).contains(&self.active_tab_index);
+        let active_offset_in_run = self.active_tab_index.saturating_sub(run.start);
+
+        // Snap target so we never split another group's run.
+        let mut target = target_first_index.min(self.tabs.len());
+        // If `target` lands in the middle of a non-target group's run, push
+        // forward to that run's end (closest valid boundary).
+        if target > 0 && target < self.tabs.len() {
+            let prev = self.tabs[target - 1].group_id;
+            let next = self.tabs[target].group_id;
+            if prev.is_some() && prev == next {
+                // Snap to the end of that run.
+                while target < self.tabs.len()
+                    && self.tabs.get(target).and_then(|t| t.group_id) == prev
+                {
+                    target += 1;
+                }
+            }
+        }
+
+        let drained_len = drained.len();
+        self.tabs.splice(target..target, drained);
+
+        if active_was_in_run {
+            self.active_tab_index = target + active_offset_in_run;
+        } else if target <= self.active_tab_index {
+            self.active_tab_index += drained_len;
+        }
+        self.debug_assert_tab_group_invariants();
+        ctx.notify();
+    }
+
+    /// Drop handler for chip drag. Computes the target landing index from
+    /// the drag's last reported position and delegates to `reorder_group`.
+    /// The UI implementation (task #5) wires `DragTabGroup` to update the
+    /// chip's `draggable_state.position` so we can read it here.
+    pub fn drop_tab_group(
+        &mut self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // Without UI-side drag math wired (task #5), drop is a no-op that
+        // resets transient drag state. Once `calculate_updated_group_position`
+        // exists, replace this with `self.reorder_group(...)`.
+        let _ = group_id;
+        ctx.notify();
+    }
+
+    /// In-place reorder primitive that preserves contiguity (TECH.md §7.3).
+    /// Used by `move_tab_into_group` and (in a follow-up) by the existing
+    /// drag/move call sites.
+    fn reorder_tab_internal(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.tabs.len() {
+            return;
+        }
+        let to = to.min(self.tabs.len().saturating_sub(1));
+        let tab = self.tabs.remove(from);
+        let insert_at = if to > from { to } else { to };
+        self.tabs.insert(insert_at.min(self.tabs.len()), tab);
+        // Update active_tab_index to track the moved tab if needed.
+        if from == self.active_tab_index {
+            self.active_tab_index = insert_at.min(self.tabs.len().saturating_sub(1));
+        } else if from < self.active_tab_index && insert_at >= self.active_tab_index {
+            self.active_tab_index -= 1;
+        } else if from > self.active_tab_index && insert_at <= self.active_tab_index {
+            self.active_tab_index += 1;
+        }
+    }
+    // ── End Tab Groups ───────────────────────────────────────────────────
+
     /// Adopts a transferred PaneGroup into the placeholder tab created during window transfer.
     /// This replaces the placeholder tab's PaneGroup with the actual transferred one.
     pub fn adopt_transferred_pane_group(
@@ -21721,6 +22173,156 @@ impl TypedActionView for Workspace {
             FinalizeDropTab => {}
             SyncTrafficLights => {
                 self.sync_window_button_visibility(ctx);
+            }
+
+            // ── Tab Groups (gated by FeatureFlag::TabGroups). ──
+            //
+            // These call into the `Workspace` lifecycle methods declared in
+            // an `impl Workspace` block alongside `remove_tab` etc. (TECH.md
+            // §7). When the flag is off, every arm is a no-op.
+            CreateTabGroupFromTab { tab_index } => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    self.create_tab_group_from_tab(*tab_index, ctx);
+                }
+            }
+            AddTabToTabGroup {
+                tab_index,
+                group_id,
+            } => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    self.move_tab_into_group(
+                        *tab_index,
+                        *group_id,
+                        crate::workspace::tab_group::TabGroupOperationSource::Menu,
+                        ctx,
+                    );
+                }
+            }
+            RemoveTabFromTabGroup { tab_index } => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    self.remove_tab_from_group(
+                        *tab_index,
+                        crate::workspace::tab_group::TabGroupOperationSource::Menu,
+                        ctx,
+                    );
+                }
+            }
+            RenameTabGroup { group_id } => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    self.rename_tab_group(*group_id, ctx);
+                }
+            }
+            SetTabGroupName { group_id, name } => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    self.set_tab_group_name(*group_id, name.clone(), ctx);
+                }
+            }
+            RecolorTabGroup { group_id, color } => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    self.recolor_tab_group(*group_id, *color, ctx);
+                }
+            }
+            ToggleTabGroupCollapsed { group_id } => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    self.toggle_tab_group_collapsed(*group_id, ctx);
+                }
+            }
+            UngroupTabGroup { group_id } => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    self.ungroup_tab_group(*group_id, ctx);
+                }
+            }
+            CloseTabGroup { group_id } => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    self.close_tab_group(*group_id, ctx);
+                }
+            }
+            ToggleTabGroupContextMenu { .. } => {
+                // Menu rendering wiring lives with the UI work (task #5).
+            }
+            StartTabGroupDrag { .. } => {
+                // Drag state is held by `TabGroup::draggable_state` and is
+                // updated when the UI emits DragTabGroup / DropTabGroup.
+            }
+            DragTabGroup { .. } => {
+                // Per-frame drag position update; consumed by chip rendering.
+            }
+            DropTabGroup { group_id } => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    self.drop_tab_group(*group_id, ctx);
+                }
+            }
+            CreateTabGroupFromActiveTab => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    let idx = self.active_tab_index;
+                    self.create_tab_group_from_tab(idx, ctx);
+                }
+            }
+            UngroupActiveTabGroup => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    if let Some(gid) = self
+                        .tabs
+                        .get(self.active_tab_index)
+                        .and_then(|t| t.group_id)
+                    {
+                        self.ungroup_tab_group(gid, ctx);
+                    }
+                }
+            }
+            CollapseActiveTabGroup => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    if let Some(gid) = self
+                        .tabs
+                        .get(self.active_tab_index)
+                        .and_then(|t| t.group_id)
+                    {
+                        self.set_tab_group_collapsed(gid, true, ctx);
+                    }
+                }
+            }
+            ExpandActiveTabGroup => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    if let Some(gid) = self
+                        .tabs
+                        .get(self.active_tab_index)
+                        .and_then(|t| t.group_id)
+                    {
+                        self.set_tab_group_collapsed(gid, false, ctx);
+                    }
+                }
+            }
+            RenameActiveTabGroup => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    if let Some(gid) = self
+                        .tabs
+                        .get(self.active_tab_index)
+                        .and_then(|t| t.group_id)
+                    {
+                        self.rename_tab_group(gid, ctx);
+                    }
+                }
+            }
+            CloseActiveTabGroup => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    if let Some(gid) = self
+                        .tabs
+                        .get(self.active_tab_index)
+                        .and_then(|t| t.group_id)
+                    {
+                        self.close_tab_group(gid, ctx);
+                    }
+                }
+            }
+            RecolorActiveTabGroup(color) => {
+                if FeatureFlag::TabGroups.is_enabled() {
+                    if let Some(gid) = self
+                        .tabs
+                        .get(self.active_tab_index)
+                        .and_then(|t| t.group_id)
+                    {
+                        self.recolor_tab_group(gid, *color, ctx);
+                    }
+                }
             }
         };
         if action.should_save_app_state_on_action() {

@@ -1471,6 +1471,8 @@ pub enum TelemetryEvent {
         direction: TabMovement,
     },
     DragAndDropTab,
+    /// Whole tab group reordered as a unit by chip drag (PRODUCT §40).
+    DragAndDropTabGroup,
     TabOperations {
         action: TabTelemetryAction,
     },
@@ -4029,6 +4031,7 @@ impl TelemetryEvent {
             | TelemetryEvent::OpenTeamFromURI
             | TelemetryEvent::SelectNavigationPaletteItem
             | TelemetryEvent::DragAndDropTab
+            | TelemetryEvent::DragAndDropTabGroup
             | TelemetryEvent::EditedInputBeforePrecmd
             | TelemetryEvent::TriedToExecuteBeforePrecmd
             | TelemetryEvent::JumpToBookmark
@@ -4661,6 +4664,7 @@ impl TelemetryEvent {
             | TelemetryEvent::MoveActiveTab { .. }
             | TelemetryEvent::MoveTab { .. }
             | TelemetryEvent::DragAndDropTab
+            | TelemetryEvent::DragAndDropTabGroup
             | TelemetryEvent::TabOperations { .. }
             | TelemetryEvent::EditedInputBeforePrecmd
             | TelemetryEvent::TriedToExecuteBeforePrecmd
@@ -5218,6 +5222,7 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::MoveActiveTab => EnablementState::Always,
             Self::MoveTab => EnablementState::Always,
             Self::DragAndDropTab => EnablementState::Always,
+            Self::DragAndDropTabGroup => EnablementState::Flag(FeatureFlag::TabGroups),
             Self::TabOperations => EnablementState::Always,
             Self::EditedInputBeforePrecmd => EnablementState::Always,
             Self::TriedToExecuteBeforePrecmd => EnablementState::Always,
@@ -5721,6 +5726,7 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::MoveActiveTab => "Move Active Tab",
             Self::MoveTab => "Move Tab",
             Self::DragAndDropTab => "Drag and Drop Tab",
+            Self::DragAndDropTabGroup => "Drag and Drop Tab Group",
             Self::TabOperations => "Tab Operations",
             Self::EditedInputBeforePrecmd => "Edited Input Before Precmd",
             Self::TriedToExecuteBeforePrecmd => "Tried to Execute Before Precmd",
@@ -6321,8 +6327,11 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::MoveActiveTab => "Move active tab left or right",
             Self::MoveTab => "Move tab left or right",
             Self::DragAndDropTab => "Tab dragged and dropped",
+            Self::DragAndDropTabGroup => "Tab group reordered as a unit by chip drag",
             Self::TabOperations => {
-                "Took operation on a tab: change color, close tab, close adjacent tabs, etc."
+                "Took operation on a tab or tab group: change color, close tab, close adjacent \
+                 tabs, create group, rename group, recolor group, collapse / expand group, add \
+                 to / remove from group, ungroup, close group, etc."
             }
             Self::EditedInputBeforePrecmd => "Input edited before precmd hook completes",
             Self::TriedToExecuteBeforePrecmd => {

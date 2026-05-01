@@ -39,6 +39,7 @@ use warpui::platform::Cursor;
 use warpui::{EntityId, WeakViewHandle, WindowId};
 
 use super::global_actions::{ForkFromExchange, ForkedConversationDestination};
+use super::tab_group::{TabGroupColor, TabGroupId};
 use super::tab_settings::{
     VerticalTabsCompactSubtitle, VerticalTabsDisplayGranularity, VerticalTabsPrimaryInfo,
     VerticalTabsTabItemMode, VerticalTabsViewMode,
@@ -246,6 +247,76 @@ pub enum WorkspaceAction {
         tab_index: usize,
         tab_position: RectF,
     },
+
+    // ── Tab Groups (gated by FeatureFlag::TabGroups) ────────────────────
+    /// Right-click → "Add tab to group" → "New group" (PRODUCT §9, §32).
+    CreateTabGroupFromTab {
+        tab_index: usize,
+    },
+    /// Right-click → "Add tab to group" → "{name}" (PRODUCT §31).
+    AddTabToTabGroup {
+        tab_index: usize,
+        group_id: TabGroupId,
+    },
+    /// Right-click → "Add tab to group" → "Remove from group" (PRODUCT §35).
+    RemoveTabFromTabGroup {
+        tab_index: usize,
+    },
+    /// Chip / section-header right-click → Rename (PRODUCT §13).
+    RenameTabGroup {
+        group_id: TabGroupId,
+    },
+    /// Inline-rename commit handler (PRODUCT §14).
+    SetTabGroupName {
+        group_id: TabGroupId,
+        name: String,
+    },
+    /// Chip / section-header right-click → Recolor → {color} (PRODUCT §17).
+    RecolorTabGroup {
+        group_id: TabGroupId,
+        color: TabGroupColor,
+    },
+    /// Chip left-click, section-header chevron, right-click → Collapse/Expand
+    /// (PRODUCT §20, §22, §29).
+    ToggleTabGroupCollapsed {
+        group_id: TabGroupId,
+    },
+    /// Chip / section-header right-click → Ungroup (PRODUCT §30 Ungroup).
+    UngroupTabGroup {
+        group_id: TabGroupId,
+    },
+    /// Chip / section-header right-click → Close group (PRODUCT §42).
+    CloseTabGroup {
+        group_id: TabGroupId,
+    },
+    /// Right-click on chip / section header (PRODUCT §30, §69).
+    ToggleTabGroupContextMenu {
+        group_id: TabGroupId,
+        position: Vector2F,
+    },
+    /// Begin a chip-drag (whole-group reorder, PRODUCT §40).
+    StartTabGroupDrag {
+        group_id: TabGroupId,
+    },
+    /// Per-frame chip drag position update.
+    DragTabGroup {
+        group_id: TabGroupId,
+        position: RectF,
+    },
+    /// Drop a chip into its new position.
+    DropTabGroup {
+        group_id: TabGroupId,
+    },
+    /// Active-tab companions for the command palette (no key bindings,
+    /// resolve to `tabs[active_tab_index].group_id` at dispatch time).
+    CreateTabGroupFromActiveTab,
+    UngroupActiveTabGroup,
+    CollapseActiveTabGroup,
+    ExpandActiveTabGroup,
+    RenameActiveTabGroup,
+    CloseActiveTabGroup,
+    RecolorActiveTabGroup(TabGroupColor),
+
     HandoffPendingTransfer {
         target_window_id: WindowId,
         insertion_index: usize,
@@ -758,6 +829,21 @@ impl WorkspaceAction {
             | SummarizeAIConversation { .. }
             | OpenRepository { .. }
             | SelectTabConfig(_)
+            | CreateTabGroupFromTab { .. }
+            | AddTabToTabGroup { .. }
+            | RemoveTabFromTabGroup { .. }
+            | SetTabGroupName { .. }
+            | RecolorTabGroup { .. }
+            | ToggleTabGroupCollapsed { .. }
+            | UngroupTabGroup { .. }
+            | CloseTabGroup { .. }
+            | DropTabGroup { .. }
+            | CreateTabGroupFromActiveTab
+            | UngroupActiveTabGroup
+            | CollapseActiveTabGroup
+            | ExpandActiveTabGroup
+            | CloseActiveTabGroup
+            | RecolorActiveTabGroup(_)
             | ToggleVerticalTabsPanel => true, // actions that actually change a state of the state of user's
             // workspace would most likely require a save, so that if the app gets
             // restarted, the user can continue working
@@ -940,6 +1026,11 @@ impl WorkspaceAction {
             | TabConfigSidecarRemoveConfig { .. }
             | OpenSettingsFile
             | FixSettingsWithOz { .. }
+            | RenameTabGroup { .. }
+            | RenameActiveTabGroup
+            | ToggleTabGroupContextMenu { .. }
+            | StartTabGroupDrag { .. }
+            | DragTabGroup { .. }
             | OpenNetworkLogPane => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,
