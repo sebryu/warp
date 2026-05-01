@@ -355,11 +355,23 @@ diesel::table! {
 }
 
 diesel::table! {
+    tab_groups (id) {
+        id -> Integer,
+        uuid -> Text,
+        window_id -> Integer,
+        name -> Text,
+        color -> Text,
+        is_collapsed -> Bool,
+    }
+}
+
+diesel::table! {
     tabs (id) {
         id -> Integer,
         window_id -> Integer,
         custom_title -> Nullable<Text>,
         color -> Nullable<Text>,
+        group_uuid -> Nullable<Text>,
     }
 }
 
@@ -509,6 +521,7 @@ diesel::joinable!(pane_branches -> pane_nodes (pane_node_id));
 diesel::joinable!(pane_leaves -> pane_nodes (pane_node_id));
 diesel::joinable!(pane_nodes -> tabs (tab_id));
 diesel::joinable!(panels -> tabs (tab_id));
+diesel::joinable!(tab_groups -> windows (window_id));
 diesel::joinable!(tabs -> windows (window_id));
 diesel::joinable!(team_members -> teams (team_id));
 diesel::joinable!(team_settings -> teams (team_id));
@@ -521,6 +534,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     pane_leaves,
     pane_nodes,
     panels,
+    tab_groups,
     tabs,
     windows,
 );
