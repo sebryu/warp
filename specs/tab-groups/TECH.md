@@ -1081,20 +1081,33 @@ Edits, all on the **source** side so the receiver has nothing extra to handle:
 
 The struct at `app/src/workspace/view.rs:880-888` does **not** gain a `group_id` field. This is the contract: the payload is ungrouped by construction.
 
-### 11.2 `Workspace::get_tab_transfer_info`
+### 11.2 Strip happens at `Workspace::remove_tab`, not `get_tab_transfer_info`
 
-At `app/src/workspace/view.rs:4774`. Before constructing `TransferredTab`, capture the source group:
-
-```rust
-let source_group_id = self.tabs[tab_index].group_id;
-self.tabs[tab_index].group_id = None;
-if let Some(g) = source_group_id {
-    self.prune_empty_group(g);
-}
-// ... existing TransferredTab construction, unchanged ...
-```
-
-This ensures (a) `TransferredTab` is built from a now-ungrouped tab, and (b) if removing the tab orphans the source group, dissolution happens before the source workspace re-renders.
+> **Spec-vs-code drift (resolved during implementation).** This section
+> originally specified the strip at `get_tab_transfer_info`. Backend
+> implementation moved the strip to `Workspace::remove_tab` (single
+> chokepoint at `app/src/workspace/view.rs:10432-10450`):
+>
+> ```rust
+> let mut tab_data = self.tabs.remove(index);
+> let departing_group = tab_data.group_id.take();
+> // ...
+> if let Some(gid) = departing_group {
+>     self.prune_empty_group(gid);
+> }
+> ```
+>
+> This is the cleaner choice. `get_tab_transfer_info` is `&self` — it
+> can't mutate state — so the strip would have required a separate
+> `&mut self` pass. Putting the take/prune in `remove_tab` instead
+> covers PRODUCT §3, §38, §53, §60-61 in **one place**: cross-window
+> handoff (which calls `remove_tab` on the source side after building
+> `TransferredTab`), single-tab close, undo-close storage, and group
+> close all share the same dissolve path.
+>
+> `TransferredTab` having no `group_id` field (§11.1) is what makes the
+> source-strip story type-safe: even without the explicit `take()`,
+> the receiver couldn't accidentally re-attach.
 
 ### 11.3 `HandoffPendingTransfer` and `ReverseHandoff` action arms
 
