@@ -10401,14 +10401,9 @@ impl Workspace {
             target_run.end
         };
         self.reorder_tab_internal(tab_idx, landing);
-        // After reorder, recompute the new index of the moved tab.
-        let new_idx = self
-            .tabs
-            .iter()
-            .position(|t| t.group_id == previous_group && previous_group.is_some())
-            .or(Some(landing.min(self.tabs.len().saturating_sub(1))))
-            .unwrap();
-        let landing = new_idx.min(self.tabs.len().saturating_sub(1));
+        // The moved tab now sits at `landing` (clamped to len - 1 by the
+        // reorder primitive). Stamp its new `group_id`.
+        let landing = landing.min(self.tabs.len().saturating_sub(1));
         self.tabs[landing].group_id = Some(group_id);
         if let Some(prev) = previous_group {
             self.prune_empty_group(prev);
@@ -10639,8 +10634,8 @@ impl Workspace {
         }
         let to = to.min(self.tabs.len().saturating_sub(1));
         let tab = self.tabs.remove(from);
-        let insert_at = if to > from { to } else { to };
-        self.tabs.insert(insert_at.min(self.tabs.len()), tab);
+        let insert_at = to.min(self.tabs.len());
+        self.tabs.insert(insert_at, tab);
         // Update active_tab_index to track the moved tab if needed.
         if from == self.active_tab_index {
             self.active_tab_index = insert_at.min(self.tabs.len().saturating_sub(1));
