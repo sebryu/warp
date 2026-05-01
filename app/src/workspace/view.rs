@@ -4897,6 +4897,23 @@ impl Workspace {
         self.tabs.get(index).and_then(|tab| tab.color())
     }
 
+    // ── Tab Groups: read-only accessors for external integration tests ──
+    // Workspace `tabs` and `tab_groups` are `pub(crate)` so internal mutation
+    // routes through the methods below (which preserve I1-I3). External
+    // crates (integration tests, `crates/integration/src/test/tab_groups.rs`)
+    // need read-only access; expose only what's needed.
+
+    /// Read-only handle to the tab group registry.
+    pub fn tab_group_registry(&self) -> &crate::workspace::tab_group::TabGroupRegistry {
+        &self.tab_groups
+    }
+
+    /// Group membership of the tab at `index`, if any. Returns `None` for
+    /// ungrouped tabs and out-of-range indices.
+    pub fn tab_group_id_at(&self, index: usize) -> Option<crate::workspace::tab_group::TabGroupId> {
+        self.tabs.get(index).and_then(|t| t.group_id)
+    }
+
     /// Get information needed for transferring a tab to another window.
     /// Returns None if the index is invalid or if this is the last tab.
     pub fn get_tab_transfer_info(&self, index: usize, ctx: &AppContext) -> Option<TransferredTab> {
@@ -9909,6 +9926,11 @@ impl Workspace {
                     OpenDialogSource::CloseOtherTabs { tab_index } => {
                         self.close_other_tabs(tab_index, true, ctx);
                     }
+                    OpenDialogSource::CloseTabGroup { group_id } => {
+                        // Confirmed: re-enter close_tab_group; this time the
+                        // close_tabs call below skips the confirmation gate.
+                        self.close_tab_group_confirmed(group_id, ctx);
+                    }
                 }
                 self.current_workspace_state
                     .is_close_session_confirmation_dialog_open = false;
@@ -10804,23 +10826,73 @@ impl Workspace {
         group_id: crate::workspace::tab_group::TabGroupId,
         ctx: &mut ViewContext<Self>,
     ) {
-        // Collect the indices descending so removals don't shift the indices
-        // we still need to act on.
+        self.close_tab_group_internal(group_id, /* skip_confirmation */ false, ctx);
+    }
+
+    /// Confirmed re-entry from the close-session confirmation dialog.
+    /// Invoked via `OpenDialogSource::CloseTabGroup { group_id }` — the
+    /// user already saw the dialog and pressed Confirm, so this run skips
+    /// the confirmation gate and does the actual closes.
+    fn close_tab_group_confirmed(
+        &mut self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.close_tab_group_internal(group_id, /* skip_confirmation */ true, ctx);
+    }
+
+    fn close_tab_group_internal(
+        &mut self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+        skip_confirmation: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // Collect indices in ascending order; `close_tabs` reverses internally
+        // so removals don't shift unprocessed indices.
         let indices: Vec<usize> = self
             .tabs
             .iter()
             .enumerate()
-            .rev()
             .filter_map(|(i, t)| (t.group_id == Some(group_id)).then_some(i))
             .collect();
-        for index in indices {
-            self.remove_tab(index, true, true, ctx);
+        if indices.is_empty() {
+            // Either a stale registry entry or a no-op call; just prune.
+            self.prune_empty_group(group_id);
+            return;
         }
-        // remove_tab → prune chain dissolves the group on the last close,
-        // but if the loop is empty (e.g. the registry had a stale entry),
-        // we still want to drop it.
-        self.prune_empty_group(group_id);
-        ctx.notify();
+
+        // Route through the same close pipeline as Close Other / Close to
+        // Right so the shared-session and unsaved-state confirmations gate
+        // the close (PRODUCT §43 — cancellation aborts the whole close, no
+        // partial closes). When `close_tabs` opens a dialog it returns
+        // false; the dialog handler at view.rs:9893 routes its
+        // `on_confirm` back into `close_tab_group_confirmed`, which calls
+        // here again with `skip_confirmation = true`.
+        let did_close = self.close_tabs(
+            indices.into_iter(),
+            OpenDialogSource::CloseTabGroup { group_id },
+            skip_confirmation,
+            /* add_to_undo_stack */ true,
+            ctx,
+        );
+
+        if did_close {
+            // Last-member close already dissolved the group via
+            // `remove_tab` → `prune_empty_group`. The trailing prune is a
+            // belt-and-braces no-op for stale registry entries.
+            self.prune_empty_group(group_id);
+            send_telemetry_from_ctx!(
+                TelemetryEvent::TabOperations {
+                    action: crate::tab::TabTelemetryAction::CloseGroup,
+                },
+                ctx
+            );
+            ctx.notify();
+        }
+        // If `did_close == false`, a confirmation dialog is on screen; do
+        // nothing here. Re-entry on confirm runs the path above with
+        // `skip_confirmation = true`. On cancel the user-visible state is
+        // unchanged and the group remains intact.
     }
 
     /// PRODUCT §40: reorder a whole group as a unit. The drag math hands

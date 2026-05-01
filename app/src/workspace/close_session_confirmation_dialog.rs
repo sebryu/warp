@@ -40,6 +40,12 @@ pub enum OpenDialogSource {
         tab_index: usize,
         direction: TabMovement,
     },
+    /// Close every member tab of a Tab Group as a single user-initiated
+    /// action (PRODUCT §42-43). Confirmation cancellation aborts the whole
+    /// close — no partial closes.
+    CloseTabGroup {
+        group_id: crate::workspace::tab_group::TabGroupId,
+    },
 }
 
 pub struct CloseSessionConfirmationDialog {
