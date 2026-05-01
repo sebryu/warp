@@ -3013,3 +3013,577 @@ fn test_open_cloud_agent_setup_guide_action_opens_management_view_and_is_idempot
         });
     });
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tab Groups — heavy state-machine tests against `Workspace`.
+//
+// Naming and coverage match the catalogue in `specs/tab-groups/TECH.md` §14.1.
+// These tests reach into `Workspace` via the public group-mutating methods and
+// assert invariants I1 (contiguity), I2 (non-empty), and I3 (active visibility)
+// from PRODUCT §3-§5, §27-§28, §40, §47-§54, §60-§61.
+//
+// Invariants are also asserted in debug builds by `debug_assert_tab_group_invariants`
+// which every group-mutating method calls on exit; the explicit assertions below
+// are the *behavioural* checks (positions, names, registry contents).
+// ────────────────────────────────────────────────────────────────────────────
+
+use crate::workspace::tab_group::{TabGroup, TabGroupColor, TabGroupId, TabGroupOperationSource};
+
+/// Returns `Some(group_id)` of the (assumed unique) group in the registry.
+fn first_group_id(workspace: &Workspace) -> TabGroupId {
+    let mut iter = workspace.tab_groups.iter();
+    let (id, _) = iter.next().expect("expected at least one tab group");
+    *id
+}
+
+/// Returns the contiguous run (start..end) of `group_id`'s members. Panics on empty.
+fn group_run(workspace: &Workspace, group_id: TabGroupId) -> std::ops::Range<usize> {
+    let run = workspace.group_member_range(group_id);
+    assert!(!run.is_empty(), "expected non-empty run for {:?}", group_id);
+    run
+}
+
+/// Insert a tab group directly into the registry, return its id.
+/// Used when a test needs to set up a multi-group fixture without going
+/// through `create_tab_group_from_tab` (which immediately enters rename mode).
+fn install_group(workspace: &mut Workspace, name: &str, color: TabGroupColor) -> TabGroupId {
+    let g = TabGroup::new(name.to_string(), color);
+    workspace.tab_groups.insert(g)
+}
+
+#[test]
+fn create_tab_group_from_tab_assigns_id_and_color() {
+    let _flag = FeatureFlag::TabGroups.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            assert_eq!(workspace.tabs.len(), 3);
+
+            workspace.create_tab_group_from_tab(1, ctx);
+
+            // PRODUCT §9: group exists in registry.
+            assert_eq!(workspace.tab_groups.len(), 1);
+            // PRODUCT §2: tab 1 is its sole member.
+            let gid = first_group_id(workspace);
+            assert_eq!(workspace.tabs[1].group_id, Some(gid));
+            assert_eq!(workspace.tabs[0].group_id, None);
+            assert_eq!(workspace.tabs[2].group_id, None);
+
+            // PRODUCT §9: empty name and a palette default color.
+            let group = workspace.tab_groups.get(gid).expect("group");
+            assert!(group.name.is_empty());
+            assert!(matches!(
+                group.color,
+                TabGroupColor::Grey
+                    | TabGroupColor::Blue
+                    | TabGroupColor::Red
+                    | TabGroupColor::Yellow
+                    | TabGroupColor::Green
+                    | TabGroupColor::Pink
+                    | TabGroupColor::Purple
+                    | TabGroupColor::Cyan,
+            ));
+
+            // PRODUCT §9: rename mode is entered immediately.
+            assert!(workspace
+                .current_workspace_state
+                .is_tab_group_being_renamed(gid));
+        });
+    });
+}
+
+#[test]
+fn move_tab_into_group_appends_to_run_end() {
+    let _flag = FeatureFlag::TabGroups.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            // Start with 5 tabs: [t0, t1, t2, t3, t4].
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            assert_eq!(workspace.tabs.len(), 5);
+
+            // Manually install a group whose members are tabs 1 and 2.
+            let gid = install_group(workspace, "Deploy", TabGroupColor::Blue);
+            workspace.tabs[1].group_id = Some(gid);
+            workspace.tabs[2].group_id = Some(gid);
+
+            // Snapshot the placeholder pane_group ids before the move so we can
+            // check that it is the same TabData that lands at the run's end.
+            let id_of_t4 = workspace.tabs[4].pane_group.id();
+
+            // Add tab 4 (an ungrouped tab past the run) into the group.
+            workspace.move_tab_into_group(4, gid, TabGroupOperationSource::Menu, ctx);
+
+            // PRODUCT §31: the tab lands at the run's end.
+            let run = group_run(workspace, gid);
+            assert!(run.contains(&(run.end - 1)));
+            assert_eq!(
+                workspace.tabs[run.end - 1].pane_group.id(),
+                id_of_t4,
+                "moved tab should be at run end"
+            );
+
+            // PRODUCT §4: the run is contiguous.
+            for i in run.clone() {
+                assert_eq!(workspace.tabs[i].group_id, Some(gid));
+            }
+
+            // The run grew from 2 to 3 members.
+            assert_eq!(run.end - run.start, 3);
+            assert_eq!(workspace.tab_groups.len(), 1);
+        });
+    });
+}
+
+#[test]
+fn move_tab_into_group_from_other_group_dissolves_source_when_singleton() {
+    let _flag = FeatureFlag::TabGroups.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+
+            let g_dst = install_group(workspace, "Dst", TabGroupColor::Blue);
+            let g_src = install_group(workspace, "Src", TabGroupColor::Red);
+            workspace.tabs[0].group_id = Some(g_dst);
+            workspace.tabs[1].group_id = Some(g_dst);
+            // Singleton source group at tab 3.
+            workspace.tabs[3].group_id = Some(g_src);
+            assert_eq!(workspace.tab_groups.len(), 2);
+
+            workspace.move_tab_into_group(3, g_dst, TabGroupOperationSource::Drag, ctx);
+
+            // Source group dissolved (PRODUCT §3, §51).
+            assert!(!workspace.tab_groups.contains(g_src));
+            assert!(workspace.tab_groups.contains(g_dst));
+            assert_eq!(workspace.tab_groups.len(), 1);
+
+            // Destination group now has 3 members, all contiguous.
+            let run = group_run(workspace, g_dst);
+            assert_eq!(run.end - run.start, 3);
+        });
+    });
+}
+
+#[test]
+fn remove_tab_from_group_keeps_position_and_dissolves_when_empty() {
+    let _flag = FeatureFlag::TabGroups.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+
+            let gid = install_group(workspace, "G", TabGroupColor::Green);
+            workspace.tabs[0].group_id = Some(gid);
+            workspace.tabs[1].group_id = Some(gid);
+
+            // Remove first member (PRODUCT §35-37): position unchanged, group_id cleared.
+            let id_before = workspace.tabs[0].pane_group.id();
+            workspace.remove_tab_from_group(0, TabGroupOperationSource::Menu, ctx);
+            assert_eq!(workspace.tabs[0].group_id, None);
+            assert_eq!(workspace.tabs[0].pane_group.id(), id_before);
+            assert!(workspace.tab_groups.contains(gid));
+
+            // Remove the last remaining member — group dissolves (PRODUCT §3, §38, §51).
+            workspace.remove_tab_from_group(1, TabGroupOperationSource::Drag, ctx);
+            assert_eq!(workspace.tabs[1].group_id, None);
+            assert!(!workspace.tab_groups.contains(gid));
+            assert_eq!(workspace.tab_groups.len(), 0);
+        });
+    });
+}
+
+#[test]
+fn remove_tab_strips_group_id_and_dissolves_empty_group() {
+    // PRODUCT §3, §38, §53, §60-61 — covered in one place because backend
+    // routes the strip through `Workspace::remove_tab` (see TECH.md §11.2 spec
+    // drift note). This test exercises the close-tab path; cross-window
+    // handoff calls into `remove_tab` on the source side and inherits the
+    // same dissolve.
+    let _flag = FeatureFlag::TabGroups.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            assert_eq!(workspace.tabs.len(), 2);
+
+            // Singleton group on tab 1.
+            let gid = install_group(workspace, "Solo", TabGroupColor::Pink);
+            workspace.tabs[1].group_id = Some(gid);
+            assert!(workspace.tab_groups.contains(gid));
+
+            // Removing tab 1 dissolves the group via the strip-and-prune path
+            // in `Workspace::remove_tab`.
+            workspace.remove_tab(1, false, false, ctx);
+            assert!(!workspace.tab_groups.contains(gid));
+        });
+    });
+}
+
+#[test]
+fn ungroup_dissolves_group_keeps_member_positions() {
+    let _flag = FeatureFlag::TabGroups.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+
+            let gid = install_group(workspace, "Investigate", TabGroupColor::Purple);
+            workspace.tabs[1].group_id = Some(gid);
+            workspace.tabs[2].group_id = Some(gid);
+
+            let id1 = workspace.tabs[1].pane_group.id();
+            let id2 = workspace.tabs[2].pane_group.id();
+
+            workspace.ungroup_tab_group(gid, ctx);
+
+            // PRODUCT §50, §54: members keep their positions; group_id cleared.
+            assert!(!workspace.tab_groups.contains(gid));
+            assert_eq!(workspace.tabs[1].group_id, None);
+            assert_eq!(workspace.tabs[2].group_id, None);
+            assert_eq!(workspace.tabs[1].pane_group.id(), id1);
+            assert_eq!(workspace.tabs[2].pane_group.id(), id2);
+        });
+    });
+}
+
+#[test]
+fn reorder_tab_chokepoint_preserves_contiguity_for_all_groups() {
+    // I1 (PRODUCT §4): every group's members are a contiguous slice. The
+    // direct call to `reorder_group` exercises the chokepoint that snaps
+    // a group's run to a non-group-interior boundary in the resulting
+    // vector, even when the requested target falls inside another group.
+    let _flag = FeatureFlag::TabGroups.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            // 6 tabs, two groups: A = {0, 1}, B = {3, 4}; tabs 2 and 5 ungrouped.
+            for _ in 0..5 {
+                workspace.add_terminal_tab(false, ctx);
+            }
+            assert_eq!(workspace.tabs.len(), 6);
+
+            let g_a = install_group(workspace, "A", TabGroupColor::Blue);
+            let g_b = install_group(workspace, "B", TabGroupColor::Red);
+            workspace.tabs[0].group_id = Some(g_a);
+            workspace.tabs[1].group_id = Some(g_a);
+            workspace.tabs[3].group_id = Some(g_b);
+            workspace.tabs[4].group_id = Some(g_b);
+
+            // Try to drop group A so its first member lands at index 4 — that
+            // would split B's run. The chokepoint snaps to the nearest boundary
+            // (end of B's run = 5).
+            workspace.reorder_group(g_a, 4, ctx);
+
+            // Both runs must remain contiguous.
+            let run_a = group_run(workspace, g_a);
+            let run_b = group_run(workspace, g_b);
+            assert_eq!(run_a.end - run_a.start, 2);
+            assert_eq!(run_b.end - run_b.start, 2);
+            for i in run_a.clone() {
+                assert_eq!(workspace.tabs[i].group_id, Some(g_a));
+            }
+            for i in run_b.clone() {
+                assert_eq!(workspace.tabs[i].group_id, Some(g_b));
+            }
+            // The runs cannot overlap.
+            assert!(run_a.end <= run_b.start || run_b.end <= run_a.start);
+        });
+    });
+}
+
+#[test]
+fn chip_drag_moves_whole_run_together() {
+    // PRODUCT §40: dragging a chip moves the whole run. This calls
+    // `reorder_group` directly with various target indices and asserts
+    // member positions and `active_tab_index` track the move.
+    let _flag = FeatureFlag::TabGroups.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            for _ in 0..4 {
+                workspace.add_terminal_tab(false, ctx);
+            }
+            assert_eq!(workspace.tabs.len(), 5);
+
+            // [t0, t1, t2(g), t3(g), t4] — group at indices 2..4. Active = 3 (in group).
+            let gid = install_group(workspace, "Run", TabGroupColor::Cyan);
+            workspace.tabs[2].group_id = Some(gid);
+            workspace.tabs[3].group_id = Some(gid);
+            workspace.active_tab_index = 3;
+
+            let id_t2 = workspace.tabs[2].pane_group.id();
+            let id_t3 = workspace.tabs[3].pane_group.id();
+
+            // Move the run to position 0.
+            workspace.reorder_group(gid, 0, ctx);
+
+            // The whole run sits at indices 0..2.
+            let run = group_run(workspace, gid);
+            assert_eq!(run, 0..2);
+            assert_eq!(workspace.tabs[0].pane_group.id(), id_t2);
+            assert_eq!(workspace.tabs[1].pane_group.id(), id_t3);
+            // active_tab_index tracks the moved active tab. Active was at offset
+            // 1 within the run, so it should now be at index 1.
+            assert_eq!(workspace.active_tab_index, 1);
+
+            // Move it back to the right end (target = current len). It should
+            // splice at the tail.
+            let len = workspace.tabs.len();
+            workspace.reorder_group(gid, len, ctx);
+
+            let run = group_run(workspace, gid);
+            assert_eq!(run.end, workspace.tabs.len());
+            assert_eq!(run.end - run.start, 2);
+            assert_eq!(
+                workspace.tabs[run.end - 1].pane_group.id(),
+                id_t3,
+                "intra-run order is preserved"
+            );
+        });
+    });
+}
+
+#[test]
+fn set_active_tab_index_force_expands_collapsed_member_group() {
+    // PRODUCT §27/§28: activating a tab inside a collapsed group expands
+    // the group as a side-effect of the activation, in the same call (no
+    // event lag), so I3 holds at the next render.
+    let _flag = FeatureFlag::TabGroups.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+
+            let gid = install_group(workspace, "G", TabGroupColor::Yellow);
+            workspace.tabs[1].group_id = Some(gid);
+            workspace.tabs[2].group_id = Some(gid);
+            // Active = 0 (ungrouped), so we can collapse the group below.
+            workspace.active_tab_index = 0;
+
+            // Collapse the group while the active tab is outside it (allowed).
+            workspace.set_tab_group_collapsed(gid, true, ctx);
+            assert!(workspace.tab_groups.get(gid).unwrap().collapsed);
+
+            // Activating tab 1 (a member) auto-expands the group.
+            workspace.activate_tab(1, ctx);
+            assert!(!workspace.tab_groups.get(gid).unwrap().collapsed);
+            assert_eq!(workspace.active_tab_index, 1);
+        });
+    });
+}
+
+#[test]
+fn set_tab_group_collapsed_no_op_while_active_member_inside() {
+    // PRODUCT §27: collapsing a group whose active tab is a member is a
+    // no-op — collapse never "sticks" while the active tab lives inside.
+    let _flag = FeatureFlag::TabGroups.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+
+            let gid = install_group(workspace, "G", TabGroupColor::Pink);
+            workspace.tabs[0].group_id = Some(gid);
+            workspace.tabs[1].group_id = Some(gid);
+            workspace.active_tab_index = 0; // active tab IS in the group.
+
+            // Attempt to collapse — must remain expanded.
+            workspace.set_tab_group_collapsed(gid, true, ctx);
+            assert!(
+                !workspace.tab_groups.get(gid).unwrap().collapsed,
+                "collapse must not stick while active tab is a member (PRODUCT §27)"
+            );
+
+            // Move active outside the group, then collapse succeeds.
+            workspace.active_tab_index = 2;
+            workspace.set_tab_group_collapsed(gid, true, ctx);
+            assert!(workspace.tab_groups.get(gid).unwrap().collapsed);
+
+            // Toggle helper inverts the flag.
+            workspace.toggle_tab_group_collapsed(gid, ctx);
+            assert!(!workspace.tab_groups.get(gid).unwrap().collapsed);
+        });
+    });
+}
+
+#[test]
+fn recolor_and_rename_tab_group_persist_through_registry() {
+    let _flag = FeatureFlag::TabGroups.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            let gid = install_group(workspace, "before", TabGroupColor::Grey);
+            workspace.tabs[0].group_id = Some(gid);
+
+            workspace.recolor_tab_group(gid, TabGroupColor::Cyan, ctx);
+            assert_eq!(
+                workspace.tab_groups.get(gid).unwrap().color,
+                TabGroupColor::Cyan
+            );
+
+            // PRODUCT §14: empty name allowed.
+            workspace.set_tab_group_name(gid, String::new(), ctx);
+            assert!(workspace.tab_groups.get(gid).unwrap().name.is_empty());
+            workspace.set_tab_group_name(gid, "Deploy".to_string(), ctx);
+            assert_eq!(workspace.tab_groups.get(gid).unwrap().name, "Deploy");
+        });
+    });
+}
+
+#[test]
+fn close_tab_group_closes_all_members_in_order() {
+    let _flag = FeatureFlag::TabGroups.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.update(disable_quit_warning);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            assert_eq!(workspace.tab_count(), 4);
+
+            let gid = install_group(workspace, "Trio", TabGroupColor::Red);
+            workspace.tabs[1].group_id = Some(gid);
+            workspace.tabs[2].group_id = Some(gid);
+            workspace.tabs[3].group_id = Some(gid);
+            workspace.active_tab_index = 0;
+
+            workspace.close_tab_group(gid, ctx);
+
+            // PRODUCT §42: every member tab is closed.
+            assert_eq!(workspace.tab_count(), 1);
+            // PRODUCT §3 + §51: group dissolves.
+            assert!(!workspace.tab_groups.contains(gid));
+        });
+    });
+}
+
+#[test]
+fn close_tab_group_cancellation_aborts_whole_close() {
+    // PRODUCT §43: cancellation aborts the whole group close — no partial.
+    // The cancel branch only fires when `should_confirm_close_session`
+    // returns true, which requires the shared-session flag stack and a
+    // shared pane in one of the members. Backend routes this through
+    // `close_tab_group` → `close_tabs(OpenDialogSource::CloseTabGroup { ... })`
+    // → confirmation dialog.
+    let _flag = FeatureFlag::TabGroups.override_enabled(true);
+    let _shared_guard = FeatureFlag::CreatingSharedSessions.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.update(disable_quit_warning);
+
+        let workspace = mock_workspace(&mut app);
+        // Three tabs, middle one shared (matches `setup_session_sharing_test`).
+        setup_session_sharing_test(&workspace, &mut app);
+
+        workspace.update(&mut app, |workspace, _ctx| {
+            assert_eq!(workspace.tab_count(), 3);
+            // Group all three tabs.
+            let gid = install_group(workspace, "Risky", TabGroupColor::Blue);
+            workspace.tabs[0].group_id = Some(gid);
+            workspace.tabs[1].group_id = Some(gid);
+            workspace.tabs[2].group_id = Some(gid);
+            // Active = ungrouped position is impossible (all are in the group);
+            // make sure tab 0 is active so the close pipeline starts there.
+            workspace.active_tab_index = 0;
+        });
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.close_tab_group(first_group_id(workspace), ctx);
+
+            // The shared pane in the middle tab triggers the confirm dialog.
+            assert!(
+                workspace
+                    .current_workspace_state
+                    .is_close_session_confirmation_dialog_open,
+                "shared pane should trigger close-session confirmation"
+            );
+            // PRODUCT §43: cancellation aborts the whole close — every member
+            // remains, group remains.
+            workspace.handle_close_session_confirmation_dialog_event(
+                &CloseSessionConfirmationEvent::Cancel,
+                ctx,
+            );
+            assert_eq!(workspace.tab_count(), 3);
+            assert!(workspace.tab_groups.len() == 1);
+        });
+    });
+}
+
+#[test]
+fn feature_flag_off_drops_tab_group_action() {
+    // PRODUCT § (implementation §8.2): action arms early-return when
+    // `FeatureFlag::TabGroups.is_enabled()` is false. Without the override
+    // guard, dispatching `CreateTabGroupFromTab` must NOT create a group
+    // (and not panic). This protects against the chip-render path being
+    // exercised on a workspace whose flag is off.
+    let _flag = FeatureFlag::TabGroups.override_enabled(false);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            assert!(!FeatureFlag::TabGroups.is_enabled());
+            workspace.handle_action(
+                &WorkspaceAction::CreateTabGroupFromTab { tab_index: 0 },
+                ctx,
+            );
+            assert_eq!(workspace.tab_groups.len(), 0);
+            assert_eq!(workspace.tabs[0].group_id, None);
+        });
+    });
+}
+
+// ── End Tab Groups view tests ──────────────────────────────────────────────
