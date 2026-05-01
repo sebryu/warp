@@ -1727,9 +1727,7 @@ fn render_groups(
                         );
                         rows.push(
                             crate::workspace::tab_group::vertical_section::wrap_member_row(
-                                member,
-                                group,
-                                appearance,
+                                member, group, appearance,
                             ),
                         );
                     }
