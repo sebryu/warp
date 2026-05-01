@@ -12,12 +12,15 @@
 use pathfinder_color::ColorU;
 use warpui::elements::{
     Border, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DragAxis, Draggable,
-    DropTarget, Element, Empty, Flex, Hoverable, MainAxisSize, Padding, ParentElement, Radius,
-    Text,
+    DropTarget, Element, Empty, Fill, Flex, Hoverable, MainAxisSize, Padding, ParentElement,
+    Radius, Text,
 };
-use warpui::AppContext;
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
+use warpui::ui_components::text_input::TextInput;
+use warpui::{AppContext, ViewHandle};
 
 use crate::appearance::Appearance;
+use crate::editor::EditorView;
 use crate::features::FeatureFlag;
 use crate::ui_components::icons::Icon;
 use crate::workspace::action::WorkspaceAction;
@@ -56,6 +59,8 @@ pub fn render_tab_group_chip(
     group: &TabGroup,
     member_count: usize,
     is_active_member: bool,
+    is_being_renamed: bool,
+    rename_editor: ViewHandle<EditorView>,
     appearance: &Appearance,
     _ctx: &AppContext,
 ) -> Box<dyn Element> {
@@ -109,15 +114,44 @@ pub fn render_tab_group_chip(
         );
     }
 
-    row.add_child(
-        Text::new_inline(
-            label_text,
-            appearance.ui_font_family(),
-            appearance.ui_font_size(),
-        )
-        .with_color(text_color)
-        .finish(),
-    );
+    if is_being_renamed {
+        // PRODUCT §13-15: chip text becomes an inline editor while
+        // rename mode is active. The editor is the workspace's
+        // `tab_group_rename_editor`; commit / cancel handlers are wired
+        // there. We strip the surrounding chrome (background, border,
+        // padding) on the TextInput to keep it visually flush with
+        // the chip's existing background.
+        row.add_child(
+            ConstrainedBox::new(
+                TextInput::new(
+                    rename_editor,
+                    UiComponentStyles::default()
+                        .set_background(Fill::None)
+                        .set_border_radius(CornerRadius::with_all(Radius::Pixels(0.)))
+                        .set_border_width(0.)
+                        .set_font_color(text_color.into()),
+                )
+                .with_style(UiComponentStyles {
+                    margin: Some(Coords::default()),
+                    ..Default::default()
+                })
+                .build()
+                .finish(),
+            )
+            .with_min_width(40.)
+            .finish(),
+        );
+    } else {
+        row.add_child(
+            Text::new_inline(
+                label_text,
+                appearance.ui_font_family(),
+                appearance.ui_font_size(),
+            )
+            .with_color(text_color)
+            .finish(),
+        );
+    }
 
     // Chip container — colored rounded rect.
     let mut chip_container = Container::new(row.finish())
@@ -149,19 +183,26 @@ pub fn render_tab_group_chip(
     //  - Left mouse-down toggles collapse (PRODUCT §20).
     //  - Right click opens the group menu (PRODUCT §69).
     //  - Double-click enters inline rename (PRODUCT §13).
-    let chip_with_handlers = Hoverable::new(group.hover_state.clone(), move |_state| constrained)
-        .on_mouse_down(move |ctx, _, _| {
-            ctx.dispatch_typed_action(WorkspaceAction::ToggleTabGroupCollapsed { group_id });
-        })
-        .on_double_click(move |ctx, _, _| {
-            ctx.dispatch_typed_action(WorkspaceAction::RenameTabGroup { group_id });
-        })
-        .on_right_click(move |ctx, _, position| {
-            ctx.dispatch_typed_action(WorkspaceAction::ToggleTabGroupContextMenu {
-                group_id,
-                position,
+    // While the chip is in rename mode, the click handlers are
+    // suppressed so the editor can take focus / receive clicks
+    // without firing collapse.
+    let mut chip_with_handlers =
+        Hoverable::new(group.hover_state.clone(), move |_state| constrained);
+    if !is_being_renamed {
+        chip_with_handlers = chip_with_handlers
+            .on_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(WorkspaceAction::ToggleTabGroupCollapsed { group_id });
+            })
+            .on_double_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(WorkspaceAction::RenameTabGroup { group_id });
             });
+    }
+    chip_with_handlers = chip_with_handlers.on_right_click(move |ctx, _, position| {
+        ctx.dispatch_typed_action(WorkspaceAction::ToggleTabGroupContextMenu {
+            group_id,
+            position,
         });
+    });
 
     // Whole-group drag (PRODUCT §40). v1 chip cross-window drag is out of
     // scope (PRODUCT §41) — we mirror the per-tab Draggable's

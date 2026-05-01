@@ -12,11 +12,14 @@
 use pathfinder_color::ColorU;
 use warpui::elements::{
     ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DragAxis, Draggable, DropTarget,
-    Element, Empty, Flex, Hoverable, MainAxisSize, Padding, ParentElement, Radius, Text,
+    Element, Empty, Fill, Flex, Hoverable, MainAxisSize, Padding, ParentElement, Radius, Text,
 };
-use warpui::AppContext;
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
+use warpui::ui_components::text_input::TextInput;
+use warpui::{AppContext, ViewHandle};
 
 use crate::appearance::Appearance;
+use crate::editor::EditorView;
 use crate::features::FeatureFlag;
 use crate::pane_group::TabBarHoverIndex;
 use crate::ui_components::icons::Icon;
@@ -50,6 +53,8 @@ pub fn render_section_header(
     group: &TabGroup,
     member_count: usize,
     effective_collapsed: bool,
+    is_being_renamed: bool,
+    rename_editor: ViewHandle<EditorView>,
     appearance: &Appearance,
     _ctx: &AppContext,
 ) -> Box<dyn Element> {
@@ -106,15 +111,40 @@ pub fn render_section_header(
             .with_width(6.)
             .finish(),
     );
-    row.add_child(
-        Text::new_inline(
-            label_text,
-            appearance.ui_font_family(),
-            appearance.ui_font_size(),
-        )
-        .with_color(text_color)
-        .finish(),
-    );
+    if is_being_renamed {
+        // PRODUCT §13-15: section header label becomes an inline editor
+        // while rename mode is active.
+        row.add_child(
+            warpui::elements::Shrinkable::new(
+                1.,
+                TextInput::new(
+                    rename_editor,
+                    UiComponentStyles::default()
+                        .set_background(Fill::None)
+                        .set_border_radius(CornerRadius::with_all(Radius::Pixels(0.)))
+                        .set_border_width(0.)
+                        .set_font_color(text_color.into()),
+                )
+                .with_style(UiComponentStyles {
+                    margin: Some(Coords::default()),
+                    ..Default::default()
+                })
+                .build()
+                .finish(),
+            )
+            .finish(),
+        );
+    } else {
+        row.add_child(
+            Text::new_inline(
+                label_text,
+                appearance.ui_font_family(),
+                appearance.ui_font_size(),
+            )
+            .with_color(text_color)
+            .finish(),
+        );
+    }
     // Spacer to push the count label to the right.
     row.add_child(warpui::elements::Shrinkable::new(1., Empty::new().finish()).finish());
     row.add_child(
@@ -136,8 +166,12 @@ pub fn render_section_header(
         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
         .finish();
 
-    let header_with_handlers =
-        Hoverable::new(group.hover_state.clone(), move |_state| header_container)
+    // While renaming, suppress the click handlers that would steal
+    // focus from the editor.
+    let mut header_with_handlers =
+        Hoverable::new(group.hover_state.clone(), move |_state| header_container);
+    if !is_being_renamed {
+        header_with_handlers = header_with_handlers
             .on_mouse_down(move |ctx, _, _| {
                 // Section header click — same toggle as the chevron
                 // (PRODUCT §22, §29).
@@ -145,13 +179,14 @@ pub fn render_section_header(
             })
             .on_double_click(move |ctx, _, _| {
                 ctx.dispatch_typed_action(WorkspaceAction::RenameTabGroup { group_id });
-            })
-            .on_right_click(move |ctx, _, position| {
-                ctx.dispatch_typed_action(WorkspaceAction::ToggleTabGroupContextMenu {
-                    group_id,
-                    position,
-                });
             });
+    }
+    header_with_handlers = header_with_handlers.on_right_click(move |ctx, _, position| {
+        ctx.dispatch_typed_action(WorkspaceAction::ToggleTabGroupContextMenu {
+            group_id,
+            position,
+        });
+    });
 
     // Whole-section drag — vertical only (PRODUCT §40, §41).
     let header_with_drag = {

@@ -1685,10 +1685,15 @@ fn render_groups(
                     group.collapsed
                 };
 
+                let is_being_renamed = workspace
+                    .current_workspace_state
+                    .is_tab_group_being_renamed(gid);
                 let header = crate::workspace::tab_group::vertical_section::render_section_header(
                     group,
                     total_member_count,
                     effective_collapsed,
+                    is_being_renamed,
+                    workspace.tab_group_rename_editor.clone(),
                     &appearance,
                     app,
                 );

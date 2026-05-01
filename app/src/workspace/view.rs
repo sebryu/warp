@@ -901,6 +901,10 @@ pub struct Workspace {
     traffic_light_mouse_states: TrafficLightMouseStates,
     tab_rename_editor: ViewHandle<EditorView>,
     pane_rename_editor: ViewHandle<EditorView>,
+    /// Inline rename editor for the chip / section header of a Tab Group
+    /// (PRODUCT §13-15). Single-line, `EditorView`-based, mirrors the
+    /// `tab_rename_editor` flow.
+    tab_group_rename_editor: ViewHandle<EditorView>,
     vertical_tabs_search_input: ViewHandle<EditorView>,
     tips_completed: ModelHandle<TipsCompleted>,
     user_default_shell_unsupported_banner_model_handle: ModelHandle<BannerState>,
@@ -1256,6 +1260,26 @@ impl Workspace {
         editor
     }
 
+    /// Inline rename editor for Tab Group chip / section header
+    /// (PRODUCT §13-15). Single-line, sized like the tab rename editor.
+    fn tab_group_rename_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
+        let editor = ctx.add_typed_action_view(|ctx| {
+            let appearance = Appearance::as_ref(ctx);
+            let options = SingleLineEditorOptions {
+                text: TextOptions::ui_text(
+                    Some(Self::tab_rename_editor_font_size(ctx, appearance)),
+                    appearance,
+                ),
+                ..Default::default()
+            };
+            EditorView::single_line(options, ctx)
+        });
+        ctx.subscribe_to_view(&editor, move |me, _, event, ctx| {
+            me.handle_tab_group_rename_editor_event(event, ctx);
+        });
+        editor
+    }
+
     fn pane_rename_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
         let editor = ctx.add_typed_action_view(|ctx| {
             let appearance = Appearance::as_ref(ctx);
@@ -1350,6 +1374,73 @@ impl Workspace {
             self.focus_active_tab(ctx);
             ctx.notify();
         }
+    }
+
+    pub fn handle_tab_group_rename_editor_event(
+        &mut self,
+        event: &EditorEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self
+            .current_workspace_state
+            .is_any_tab_group_being_renamed()
+        {
+            match event {
+                EditorEvent::Blurred | EditorEvent::Enter => {
+                    self.finish_tab_group_rename(ctx);
+                }
+                EditorEvent::Escape => {
+                    self.cancel_tab_group_rename(ctx);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// PRODUCT §14: commit on Enter or focus loss. Empty strings are
+    /// allowed (the chip falls back to the color name in render).
+    fn finish_tab_group_rename(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(group_id) = self.current_workspace_state.tab_group_being_renamed() else {
+            return;
+        };
+        self.current_workspace_state.clear_tab_group_being_renamed();
+        let new_name = self.tab_group_rename_editor.as_ref(ctx).buffer_text(ctx);
+        let new_name = new_name.trim().to_string();
+        // Only dispatch if the name actually changed; otherwise treat
+        // the commit as a cancel so we don't hit the save path or
+        // emit a telemetry event for a no-op.
+        let changed = self
+            .tab_groups
+            .get(group_id)
+            .map(|g| g.name != new_name)
+            .unwrap_or(false);
+        self.clear_tab_group_rename_editor(ctx);
+        if changed {
+            ctx.dispatch_typed_action(&WorkspaceAction::SetTabGroupName {
+                group_id,
+                name: new_name,
+            });
+        }
+        ctx.notify();
+    }
+
+    /// PRODUCT §14: cancel on Escape — reverts to the stored name.
+    fn cancel_tab_group_rename(&mut self, ctx: &mut ViewContext<Self>) {
+        if self
+            .current_workspace_state
+            .is_any_tab_group_being_renamed()
+        {
+            self.current_workspace_state.clear_tab_group_being_renamed();
+            self.clear_tab_group_rename_editor(ctx);
+            ctx.notify();
+        }
+    }
+
+    fn clear_tab_group_rename_editor(&mut self, ctx: &mut ViewContext<Self>) {
+        self.tab_group_rename_editor
+            .update(ctx, move |editor, ctx| {
+                editor.clear_buffer_and_reset_undo_stack(ctx);
+            });
     }
 
     fn cancel_pane_rename(&mut self, ctx: &mut ViewContext<Self>) {
@@ -3069,6 +3160,7 @@ impl Workspace {
             traffic_light_mouse_states: Default::default(),
             tab_rename_editor: Self::tab_rename_editor(ctx),
             pane_rename_editor: Self::pane_rename_editor(ctx),
+            tab_group_rename_editor: Self::tab_group_rename_editor(ctx),
             vertical_tabs_search_input: Self::vertical_tabs_search_input(ctx),
             tips_completed,
             user_default_shell_unsupported_banner_model_handle,
@@ -10579,12 +10671,49 @@ impl Workspace {
     /// dispatcher calls.
     pub fn rename_tab_group(
         &mut self,
-        _group_id: crate::workspace::tab_group::TabGroupId,
+        group_id: crate::workspace::tab_group::TabGroupId,
         ctx: &mut ViewContext<Self>,
     ) {
-        // UI wiring (task #5) installs the inline-rename editor on the chip
-        // and reports back via SetTabGroupName. Until that lands, this is a
-        // notification-only entry point so the action reaches the view tree.
+        // PRODUCT §15: only one rename of any kind is active at a time.
+        // Cancel an in-progress tab/pane rename so they don't fight for
+        // focus or commit to the wrong target.
+        if self.current_workspace_state.is_tab_being_renamed() {
+            self.cancel_tab_rename(ctx);
+        }
+        if self.current_workspace_state.is_any_pane_being_renamed() {
+            self.cancel_pane_rename(ctx);
+        }
+        // If we were already renaming a *different* group, cancel that too.
+        if self
+            .current_workspace_state
+            .is_any_tab_group_being_renamed()
+            && !self
+                .current_workspace_state
+                .is_tab_group_being_renamed(group_id)
+        {
+            self.cancel_tab_group_rename(ctx);
+        }
+
+        // No-op if the registry doesn't know about this group anymore
+        // (e.g. the menu fired after Ungroup).
+        let Some(group) = self.tab_groups.get(group_id) else {
+            return;
+        };
+        let initial_text = group.name.clone();
+
+        self.current_workspace_state
+            .set_tab_group_being_renamed(group_id);
+
+        // Pre-fill the editor with the current name. Mirrors
+        // `rename_tab_internal` (`view.rs:5078-5081`).
+        let font_size = Self::tab_rename_editor_font_size(ctx, Appearance::as_ref(ctx));
+        self.clear_tab_group_rename_editor(ctx);
+        self.tab_group_rename_editor
+            .update(ctx, move |editor, ctx| {
+                editor.set_font_size(font_size, ctx);
+                editor.insert_selected_text(&initial_text, ctx);
+            });
+        ctx.focus(&self.tab_group_rename_editor);
         ctx.notify();
     }
 
@@ -17845,11 +17974,15 @@ impl Workspace {
                             let member_count = run.end - run.start;
                             let is_active_member =
                                 (run.start..run.end).contains(&self.active_tab_index);
+                            let is_being_renamed =
+                                self.current_workspace_state.is_tab_group_being_renamed(gid);
                             tab_bar.add_child(
                                 crate::workspace::tab_group::chip::render_tab_group_chip(
                                     group,
                                     member_count,
                                     is_active_member,
+                                    is_being_renamed,
+                                    self.tab_group_rename_editor.clone(),
                                     appearance,
                                     ctx,
                                 ),

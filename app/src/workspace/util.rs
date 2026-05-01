@@ -129,6 +129,12 @@ pub struct WorkspaceState {
     pub is_transcript_details_panel_open: bool,
     tab_being_renamed: Option<usize>, // The index of the tab being renamed
     pane_being_renamed: Option<PaneViewLocator>,
+    /// Index of the Tab Group currently being renamed via the inline editor
+    /// on its chip / section header (PRODUCT §13-15). At most one rename of
+    /// any kind (tab / pane / group) is active at a time — see the cancel
+    /// chains in `set_tab_being_renamed` / `set_pane_being_renamed` /
+    /// `set_tab_group_being_renamed`.
+    tab_group_being_renamed: Option<crate::workspace::tab_group::TabGroupId>,
 }
 
 impl WorkspaceState {
@@ -146,6 +152,7 @@ impl WorkspaceState {
             || self.is_changelog_modal_open
             || self.tab_being_renamed.is_some()
             || self.pane_being_renamed.is_some()
+            || self.tab_group_being_renamed.is_some()
             || self.is_reward_modal_open
             || self.is_launch_config_save_modal_open
             || self.is_command_search_open
@@ -187,6 +194,7 @@ impl WorkspaceState {
         self.is_changelog_modal_open = false;
         self.tab_being_renamed = None;
         self.pane_being_renamed = None;
+        self.tab_group_being_renamed = None;
         self.is_reward_modal_open = false;
         self.is_launch_config_save_modal_open = false;
         self.is_command_search_open = false;
@@ -230,6 +238,7 @@ impl WorkspaceState {
     pub fn set_tab_being_renamed(&mut self, index: usize) {
         self.tab_being_renamed = Some(index);
         self.pane_being_renamed = None;
+        self.tab_group_being_renamed = None;
     }
 
     pub fn clear_tab_being_renamed(&mut self) {
@@ -251,6 +260,7 @@ impl WorkspaceState {
     pub fn set_pane_being_renamed(&mut self, pane: PaneViewLocator) {
         self.pane_being_renamed = Some(pane);
         self.tab_being_renamed = None;
+        self.tab_group_being_renamed = None;
     }
 
     pub fn clear_pane_being_renamed(&mut self) {
@@ -259,6 +269,35 @@ impl WorkspaceState {
 
     pub fn pane_being_renamed(&self) -> Option<PaneViewLocator> {
         self.pane_being_renamed
+    }
+
+    pub fn is_any_tab_group_being_renamed(&self) -> bool {
+        self.tab_group_being_renamed.is_some()
+    }
+
+    pub fn is_tab_group_being_renamed(
+        &self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+    ) -> bool {
+        self.tab_group_being_renamed == Some(group_id)
+    }
+
+    pub fn set_tab_group_being_renamed(
+        &mut self,
+        group_id: crate::workspace::tab_group::TabGroupId,
+    ) {
+        self.tab_group_being_renamed = Some(group_id);
+        // PRODUCT §15: at most one rename of any kind is active at a time.
+        self.tab_being_renamed = None;
+        self.pane_being_renamed = None;
+    }
+
+    pub fn clear_tab_group_being_renamed(&mut self) {
+        self.tab_group_being_renamed = None;
+    }
+
+    pub fn tab_group_being_renamed(&self) -> Option<crate::workspace::tab_group::TabGroupId> {
+        self.tab_group_being_renamed
     }
 }
 
