@@ -100,7 +100,7 @@ pub fn render_tab_group_chip(
     // Leading dot — omitted in the fallback case to avoid stutter (the
     // color-name label already conveys the color).
     if !is_fallback_label {
-        let dot_color = theme.font_color(chip_color_u).into();
+        let dot_color = theme.font_color(chip_color_u);
         let dot = ConstrainedBox::new(Icon::Ellipse.to_warpui_icon(dot_color).finish())
             .with_width(CHIP_LEADING_DOT_DIAMETER)
             .with_height(CHIP_LEADING_DOT_DIAMETER)
@@ -129,7 +129,7 @@ pub fn render_tab_group_chip(
                         .set_background(Fill::None)
                         .set_border_radius(CornerRadius::with_all(Radius::Pixels(0.)))
                         .set_border_width(0.)
-                        .set_font_color(text_color.into()),
+                        .set_font_color(text_color),
                 )
                 .with_style(UiComponentStyles {
                     margin: Some(Coords::default()),

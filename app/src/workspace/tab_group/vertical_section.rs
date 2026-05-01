@@ -123,7 +123,7 @@ pub fn render_section_header(
                         .set_background(Fill::None)
                         .set_border_radius(CornerRadius::with_all(Radius::Pixels(0.)))
                         .set_border_width(0.)
-                        .set_font_color(text_color.into()),
+                        .set_font_color(text_color),
                 )
                 .with_style(UiComponentStyles {
                     margin: Some(Coords::default()),

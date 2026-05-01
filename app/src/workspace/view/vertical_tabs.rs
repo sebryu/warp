@@ -1694,7 +1694,7 @@ fn render_groups(
                     effective_collapsed,
                     is_being_renamed,
                     workspace.tab_group_rename_editor.clone(),
-                    &appearance,
+                    appearance,
                     app,
                 );
 
@@ -1729,7 +1729,7 @@ fn render_groups(
                             crate::workspace::tab_group::vertical_section::wrap_member_row(
                                 member,
                                 group,
-                                &appearance,
+                                appearance,
                             ),
                         );
                     }

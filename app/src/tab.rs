@@ -774,6 +774,12 @@ impl TabStyles {
 }
 
 impl<'a> TabComponent<'a> {
+    // 8 args is a step over clippy's default. Adding a `group_color` parameter
+    // for Tab Groups (PRODUCT §18) tipped this constructor over the limit;
+    // builder pattern would obscure the call sites for one extra parameter.
+    // Matches the precedent set by other view-construction helpers in this
+    // crate (e.g. `ui_components::color_dot::*`, `menu::*::new`).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tab_index: usize,
         tab_bar: TabBarState,
