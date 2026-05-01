@@ -6514,7 +6514,7 @@ impl Workspace {
         }
 
         let tab = &self.tabs[tab_index];
-        let menu_items = tab.menu_items(tab_index, self.tabs.len(), ctx);
+        let menu_items = tab.menu_items(tab_index, self.tabs.len(), self, ctx);
         ctx.update_view(&self.tab_right_click_menu, |context_menu, view_ctx| {
             context_menu.set_items(menu_items, view_ctx);
         });
@@ -6562,6 +6562,7 @@ impl Workspace {
             tab_index,
             self.tabs.len(),
             Some(pane_name_target),
+            self,
             ctx,
         );
 

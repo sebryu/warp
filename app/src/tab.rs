@@ -199,9 +199,10 @@ impl TabData {
         &self,
         index: usize,
         tabs_len: usize,
+        workspace: &crate::workspace::Workspace,
         ctx: &AppContext,
     ) -> Vec<MenuItem<WorkspaceAction>> {
-        self.menu_items_with_pane_name_target(index, tabs_len, None, ctx)
+        self.menu_items_with_pane_name_target(index, tabs_len, None, workspace, ctx)
     }
 
     pub fn menu_items_with_pane_name_target(
@@ -209,6 +210,7 @@ impl TabData {
         index: usize,
         tabs_len: usize,
         pane_name_target: Option<PaneNameMenuTarget>,
+        workspace: &crate::workspace::Workspace,
         ctx: &AppContext,
     ) -> Vec<MenuItem<WorkspaceAction>> {
         let appearance = Appearance::as_ref(ctx);
@@ -218,6 +220,10 @@ impl TabData {
         for section_items in [
             self.session_sharing_menu_items(index, ctx),
             self.modify_tab_menu_items(index, tabs_len, pane_name_target, ctx),
+            // Tab Groups: "Add tab to group" submenu (PRODUCT §9, §31, §35,
+            // §66-67). Empty when `FeatureFlag::TabGroups` is off so the
+            // existing menu shape is unchanged for non-flagged builds.
+            self.add_tab_to_group_menu_items(index, workspace),
             self.close_tab_menu_items(index, tabs_len, ctx),
             Self::save_config_menu_items(index),
             self.color_option_menu_items(index, terminal_colors),
@@ -231,6 +237,86 @@ impl TabData {
             menu_items.extend(section_items);
         }
         menu_items
+    }
+
+    /// "Add tab to group" submenu (PRODUCT §66-67). Lists `New group`,
+    /// then one entry per existing group in this window (the tab's
+    /// current group is shown disabled per PRODUCT §67), then a leading
+    /// `Remove from group` entry when the tab is currently in a group.
+    fn add_tab_to_group_menu_items(
+        &self,
+        index: usize,
+        workspace: &crate::workspace::Workspace,
+    ) -> Vec<MenuItem<WorkspaceAction>> {
+        if !FeatureFlag::TabGroups.is_enabled() {
+            return vec![];
+        }
+
+        let mut submenu_items: Vec<MenuItem<WorkspaceAction>> = vec![];
+
+        // Removal entry (only when the tab is in a group). Renders at the
+        // top of the submenu, separated from the group list below.
+        if self.group_id.is_some() {
+            submenu_items.push(
+                MenuItemFields::new("Remove from group")
+                    .with_on_select_action(WorkspaceAction::RemoveTabFromTabGroup {
+                        tab_index: index,
+                    })
+                    .into_item(),
+            );
+            submenu_items.push(MenuItem::Separator);
+        }
+
+        // "New group" — always available.
+        submenu_items.push(
+            MenuItemFields::new("New group")
+                .with_on_select_action(WorkspaceAction::CreateTabGroupFromTab { tab_index: index })
+                .into_item(),
+        );
+
+        // Existing groups in this window. The tab's current group is
+        // disabled (PRODUCT §67); empty-named groups fall back to their
+        // color name in the menu label, mirroring the chip's fallback.
+        let mut group_entries: Vec<(crate::workspace::tab_group::TabGroupId, String, bool)> =
+            workspace
+                .tab_groups
+                .iter()
+                .map(|(gid, group)| {
+                    let label = if group.name.is_empty() {
+                        group.color.display_name().to_string()
+                    } else {
+                        group.name.clone()
+                    };
+                    let is_current = self.group_id == Some(*gid);
+                    (*gid, label, is_current)
+                })
+                .collect();
+        // Stable, alphabetic order so the menu is predictable across
+        // renders (HashMap iteration is otherwise undefined).
+        group_entries.sort_by(|a, b| a.1.cmp(&b.1));
+
+        if !group_entries.is_empty() {
+            submenu_items.push(MenuItem::Separator);
+            for (gid, label, is_current) in group_entries {
+                let item = MenuItemFields::new(label)
+                    .with_disabled(is_current)
+                    .with_on_select_action(WorkspaceAction::AddTabToTabGroup {
+                        tab_index: index,
+                        group_id: gid,
+                    });
+                submenu_items.push(item.into_item());
+            }
+        }
+
+        // Use the deprecated `MenuItem::submenu` constructor — the
+        // `Menu` crate uses `submenu` to wrap a label + nested menu. The
+        // deprecation is a parallel-development warning (the Warp menu
+        // refactor is in flight), but the function is still the canonical
+        // way to construct submenus today; suppress with `#[allow]` to
+        // mirror existing patterns elsewhere in the menu code.
+        #[allow(deprecated)]
+        let submenu = MenuItem::submenu("Add tab to group", submenu_items);
+        vec![submenu]
     }
 
     fn session_sharing_menu_items(
