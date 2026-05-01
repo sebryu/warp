@@ -214,6 +214,12 @@ integration_tests! {
 
     test_close_tab_with_long_running_process,
 
+    // Tab Groups
+    test_tab_groups_create_via_action_assigns_membership,
+    test_tab_groups_add_recolor_collapse_lifecycle,
+    test_tab_groups_remove_dissolves_singleton,
+    test_tab_groups_ungroup_dissolves_keeps_member_positions,
+
     test_restore_single_closed_pane,
     test_restore_multiple_closed_panes,
     test_undo_close_grace_period_cleanup,

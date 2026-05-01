@@ -341,6 +341,12 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
 
     register_test!(test_close_tab_with_long_running_process);
 
+    // Tab Groups
+    register_test!(test_tab_groups_create_via_action_assigns_membership);
+    register_test!(test_tab_groups_add_recolor_collapse_lifecycle);
+    register_test!(test_tab_groups_remove_dissolves_singleton);
+    register_test!(test_tab_groups_ungroup_dissolves_keeps_member_positions);
+
     register_test!(test_restore_single_closed_pane);
     register_test!(test_restore_multiple_closed_panes);
     register_test!(test_undo_close_grace_period_cleanup);
