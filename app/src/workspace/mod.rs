@@ -1544,6 +1544,15 @@ pub struct VerticalTabsPaneDropTargetData {
 pub enum TabBarLocation {
     TabIndex(usize),
     AfterTabIndex(usize), // Indicates any area after the tabs in the tab bar, includes the total tab count
+    /// Drop target on a Tab Group chip / section header. Adds the dragged
+    /// tab to the group at the run's end (PRODUCT §33).
+    OnGroupChip(crate::workspace::tab_group::TabGroupId),
+    /// Drop target just before the group's run; the dragged tab lands as
+    /// an ungrouped peer immediately preceding the group (PRODUCT §40).
+    BeforeGroup(crate::workspace::tab_group::TabGroupId),
+    /// Drop target just after the group's run; ungrouped peer
+    /// immediately following the group.
+    AfterGroup(crate::workspace::tab_group::TabGroupId),
 }
 
 impl DropTargetData for TabBarDropTargetData {

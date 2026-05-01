@@ -14160,6 +14160,11 @@ impl Workspace {
                                 );
                             });
                         }
+                        // Pane drop onto a Tab Group chip is intentionally
+                        // a no-op for v1 — chips are not pane containers
+                        // (PRODUCT §20: chip is not a tab and has no
+                        // PaneGroup). The pane stays where it is.
+                        TabBarHoverIndex::OverGroupChip(_) => {}
                     }
                 }
             }
@@ -17073,7 +17078,7 @@ impl Workspace {
             .as_ref()
             .is_some_and(|hovered_index| match hovered_index {
                 TabBarHoverIndex::OverTab(idx) => *idx == tab_index,
-                TabBarHoverIndex::BeforeTab(_) => false,
+                TabBarHoverIndex::BeforeTab(_) | TabBarHoverIndex::OverGroupChip(_) => false,
             });
 
         TabComponent::new(
@@ -17670,7 +17675,7 @@ impl Workspace {
                 if self.hovered_tab_index.as_ref().is_some_and(
                     |hovered_index| match hovered_index {
                         TabBarHoverIndex::BeforeTab(idx) => i == *idx,
-                        TabBarHoverIndex::OverTab(_) => false,
+                        TabBarHoverIndex::OverTab(_) | TabBarHoverIndex::OverGroupChip(_) => false,
                     },
                 ) {
                     tab_bar.add_child(self.render_tab_hover_indicator(appearance));
@@ -17684,7 +17689,7 @@ impl Workspace {
                 .as_ref()
                 .is_some_and(|hovered_index| match hovered_index {
                     TabBarHoverIndex::BeforeTab(idx) => self.tabs.len() == *idx,
-                    TabBarHoverIndex::OverTab(_) => false,
+                    TabBarHoverIndex::OverTab(_) | TabBarHoverIndex::OverGroupChip(_) => false,
                 })
             {
                 tab_bar.add_child(self.render_tab_hover_indicator(appearance));

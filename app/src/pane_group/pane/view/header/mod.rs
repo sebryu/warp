@@ -354,6 +354,14 @@ impl<P: BackingView> PaneHeader<P> {
                 }
             }
             TabBarLocation::AfterTabIndex(tab_count) => TabBarHoverIndex::BeforeTab(*tab_count),
+            // Tab Groups (PRODUCT §33, §40): the chip / before-group /
+            // after-group drop targets all surface as a "hover over the
+            // group's chip" indicator. The drop dispatcher in
+            // `Workspace::resolve_drop` (see TECH.md §10.6) decides the
+            // actual landing semantics from the original `TabBarLocation`.
+            TabBarLocation::OnGroupChip(group_id)
+            | TabBarLocation::BeforeGroup(group_id)
+            | TabBarLocation::AfterGroup(group_id) => TabBarHoverIndex::OverGroupChip(*group_id),
         }
     }
 }

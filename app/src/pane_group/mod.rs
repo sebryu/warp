@@ -736,6 +736,9 @@ pub enum Event {
 pub enum TabBarHoverIndex {
     BeforeTab(usize),
     OverTab(usize),
+    /// Hovering directly over a Tab Group chip (or vertical-tabs section
+    /// header). The drop adds the dragged tab to that group (PRODUCT §33).
+    OverGroupChip(crate::workspace::tab_group::TabGroupId),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1175,6 +1178,12 @@ impl PaneGroup {
                                     hidden_pane_preview_direction: *hidden_pane_preview_direction,
                                 })
                             }
+                            // Pane-onto-chip is intentionally a no-op: a
+                            // dragged pane has nothing to do with a tab
+                            // group's container. The hover index still
+                            // updates below so the chip can render the
+                            // hover treatment, but no move happens.
+                            TabBarHoverIndex::OverGroupChip(_) => {}
                         };
                     }
 

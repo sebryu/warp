@@ -10,9 +10,13 @@
 use std::collections::HashMap;
 
 use enum_iterator::{all, Sequence};
+use pathfinder_color::ColorU;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use warpui::elements::{DraggableState, MouseStateHandle};
+use warp_core::ui::theme::WarpTheme;
+use warpui::elements::{DraggableState, Fill, MouseStateHandle};
+
+pub mod chip;
 
 /// Distinguishes how a tab-group operation was initiated, so telemetry can
 /// separate menu-driven vs. drag-driven actions (TECH.md §12.3).
@@ -80,6 +84,43 @@ impl TabGroupColor {
     /// All palette entries in PRODUCT §6 order.
     pub fn all_in_order() -> Vec<Self> {
         all::<Self>().collect()
+    }
+
+    /// Resolves the palette entry to a concrete `Fill` for chip / section
+    /// header / member-tab band rendering. The mapping follows TECH.md
+    /// Appendix A: prefer existing semantic theme accessors where they fit
+    /// (so dark/light themes both work), fall back to a Chrome-tab-group-
+    /// inspired hex literal for hues with no Warp semantic equivalent.
+    ///
+    /// Hex literals here are flagged for designer review before Stable
+    /// promotion (TECH.md §15.1, §16). When designers land semantic
+    /// accessors in `crates/warp_core/src/ui/theme/color.rs`, swap the
+    /// arms below.
+    pub fn to_fill(self, theme: &WarpTheme) -> Fill {
+        match self {
+            // Semantic accessors — theme-keyed so dark/light tone-match.
+            TabGroupColor::Red => Fill::Solid(theme.ui_error_color()),
+            TabGroupColor::Yellow => Fill::Solid(theme.ui_yellow_color()),
+            TabGroupColor::Green => Fill::Solid(theme.ui_green_color()),
+            // Hex literals — Chrome-tab-group palette. See Appendix A.
+            TabGroupColor::Grey => Fill::Solid(ColorU::new(0x5F, 0x63, 0x68, 0xFF)),
+            TabGroupColor::Blue => Fill::Solid(ColorU::new(0x1A, 0x73, 0xE8, 0xFF)),
+            TabGroupColor::Pink => Fill::Solid(ColorU::new(0xD0, 0x18, 0x84, 0xFF)),
+            TabGroupColor::Purple => Fill::Solid(ColorU::new(0xA1, 0x42, 0xF4, 0xFF)),
+            TabGroupColor::Cyan => Fill::Solid(ColorU::new(0x00, 0x7B, 0x83, 0xFF)),
+        }
+    }
+
+    /// The solid `ColorU` underlying `to_fill`. Useful where downstream
+    /// code wants a `ColorU` (e.g. `WarpTheme::font_color`) without
+    /// re-extracting from the `Fill::Solid(_)` arm.
+    pub fn to_color_u(self, theme: &WarpTheme) -> ColorU {
+        match self.to_fill(theme) {
+            Fill::Solid(c) => c,
+            // The mapping above is exhaustively `Fill::Solid(_)`; this arm
+            // is unreachable in practice but kept defensive.
+            _ => ColorU::new(0x5F, 0x63, 0x68, 0xFF),
+        }
     }
 }
 
