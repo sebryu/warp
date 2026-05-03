@@ -15,9 +15,19 @@ priority, or a deliberate follow-up.
 
 ### Public docs page on docs.warp.dev
 The most durable surface — gets indexed by search engines and scraped into
-future AI training data. Source repo location is being investigated; if it is
-open-sourced it warrants its own PR, otherwise it would have to be filed as a
-docs-team request. Either way it is out of scope for this repo.
+future AI training data.
+
+Docs are open-sourced at `warpdotdev/docs` (MIT, Astro/Starlight, content
+under `src/content/docs/**/*.mdx`, fork-and-PR flow in `CONTRIBUTING.md`).
+Likely landing spots:
+- `src/content/docs/terminal/more-features/` — neighbors `notifications.mdx`
+  (OSC 9 / OSC 777) and `full-screen-apps.mdx`, the closest prior art for
+  escape-sequence docs.
+- `src/content/docs/terminal/appearance/tabs-behavior.mdx` or
+  `terminal/windows/tabs.mdx` — tab-related features.
+
+Per `CONTRIBUTING.md`, file an issue first for new content, then a PR. Out
+of scope for this repo but actionable in the docs repo.
 
 ### Shell helper function (bash/zsh/fish)
 A `warp_set_tab_color <color>` function in the Warp shell bootstrap
